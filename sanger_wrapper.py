@@ -221,7 +221,7 @@ def run_workflow(forward_dir, reverse_dir, output_dir, trim_quality=0.05, sample
     rc, output = workflow_run(forward_dir, reverse_dir, output_dir, trim_quality=trim_quality, sample_name=sample_name)
     if output:
         print(output)
-    return rc
+    return rc, output
 
 
 def run_batch_workflow(auto_dir, output_dir, trim_quality=0.05):

@@ -879,7 +879,7 @@ def main():
         ("Step 19",   "Align sequences (MAFFT)", "final_aligned.fasta"),
     ]
     for galaxy_step, tool_name, output_file in mapping:
-        print(f"  Galaxy {galaxy_step:12s} | {tool_name:30s} | {output_file}")
+        print(f"{galaxy_step:12s} | {tool_name:30s} | {output_file}")
 
     print("\nDone!")
 

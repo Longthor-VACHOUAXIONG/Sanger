@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Sanger Sequencing Workflow - Python implementation of Galaxy-Workflow-Sanger.ga
+Sanger Sequencing Workflow
 
-Pipeline (mirrors the Galaxy workflow step-by-step):
+Pipeline:
   1. AB1 to FASTQ conversion (forward & reverse collections)
   2. Quality trimming (seqtk trimfq equivalent, q=0.05 → Phred 13)
   3. Sort collections alphabetically
@@ -63,7 +63,7 @@ IUPAC = {
 def read_ab1_quality(ab1_path: str) -> list:
     """
     Read quality scores directly from AB1 file using the PHRD tag.
-    This matches Galaxy's ab1_fastq_converter which reads PHRD directly.
+    This matches the ab1_fastq_converter which reads PHRD directly.
     """
     try:
         import struct
@@ -117,20 +117,20 @@ def read_ab1_quality(ab1_path: str) -> list:
 def ab1_to_fastq(ab1_path: str) -> SeqRecord:
     """
     Convert a single .ab1 chromatogram file to a SeqRecord with quality scores.
-    Matches Galaxy's 'ab1 to FASTQ converter' (toolshed ecology/ab1_fastq_converter).
+    Matches the 'ab1 to FASTQ converter'.
     Reads PHRD quality scores directly from the AB1 file.
     """
     record = SeqIO.read(ab1_path, "abi")
 
-    # Try to read quality scores directly from PHRD tag (Galaxy's method)
+    # Try to read quality scores directly from PHRD tag
     phrd_quals = read_ab1_quality(ab1_path)
 
     if phrd_quals and len(phrd_quals) == len(record.seq):
-        # Use PHRD quality scores directly (matches Galaxy)
+        # Use PHRD quality scores directly
         record.letter_annotations["phred_quality"] = phrd_quals
     elif not record.letter_annotations.get("phred_quality"):
         # Fallback: use BioPython's extracted quality or default
-        # BioPython's quality extraction might differ from Galaxy
+        # BioPython's quality extraction might differ
         record.letter_annotations["phred_quality"] = [20] * len(record.seq)
 
     return record

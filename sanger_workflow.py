@@ -373,7 +373,6 @@ def mafft_align(records: list, method: str = "auto") -> tuple:
     """
     Run MAFFT alignment on a list of SeqRecords.
     Returns (aligned_records, log_string).
-    Equivalent to Galaxy's qiime_align_seqs with mafft method.
     """
     # Write sequences to temp file
     import tempfile
@@ -415,7 +414,7 @@ def mafft_align(records: list, method: str = "auto") -> tuple:
 # ===========================================================================
 def aligned_to_consensus(aligned_records: list, aligned_with_quals: list = None, sample_name: str = "consensus") -> SeqRecord:
     """
-    Build consensus matching Galaxy's aligned_to_consensus tool.
+    Build consensus from aligned FASTA.
     method=chr_ambiguity, gaps=false, seqtype=DNA
 
     Algorithm:
@@ -470,7 +469,7 @@ def aligned_to_consensus(aligned_records: list, aligned_with_quals: list = None,
         raw_consensus.append(best_base)
 
     # Step 2: No trimming - keep all columns where at least 1 base exists
-    # Galaxy's gaps=false means: skip gap bases in voting, but still include
+    # gaps=false means: skip gap bases in voting, but still include
     # the position in consensus if any sequence has a base there.
     consensus_seq = Seq("".join(raw_consensus))
     return SeqRecord(consensus_seq, id=sample_name, description="")
@@ -486,7 +485,6 @@ def regex_find_replace_fasta(fasta_str: str) -> str:
     This ensures there's a newline before the '>' header when the previous
     line ends with a base character, effectively formatting multi-line FASTA
     into one-sequence-per-line format.
-    Equivalent to Galaxy's Regex Find And Replace.
     """
     result = re.sub(r"([A-Z\-])>", r"\1\n>", fasta_str)
     return result
@@ -533,7 +531,6 @@ def main():
 
     # ---------------------------------------------------------------
     # STEP 1 & 2: AB1 → FASTQ conversion (Forward & Reverse)
-    # Galaxy steps 2 & 3: ab1 to FASTQ converter
     # ---------------------------------------------------------------
     print("\n[Step 1] Reading AB1 files and converting to FASTQ...")
 
@@ -564,7 +561,6 @@ def main():
 
     # ---------------------------------------------------------------
     # STEP 3: Quality Trimming (seqtk trimfq -q 0.05)
-    # Galaxy steps 4 & 5
     # ---------------------------------------------------------------
     print(f"\n[Step 2] Quality trimming (q={args.trim_quality}, Phred≥{int(-10*math.log10(args.trim_quality))})...")
 
@@ -581,7 +577,6 @@ def main():
 
     # ---------------------------------------------------------------
     # STEP 4: Sort collections alphabetically
-    # Galaxy step 6
     # ---------------------------------------------------------------
     print("\n[Step 3] Sorting collections alphabetically...")
 
@@ -593,7 +588,6 @@ def main():
 
     # ---------------------------------------------------------------
     # STEP 5: FASTQ Groomer (reverse reads → fastqsanger)
-    # Galaxy step 7
     # ---------------------------------------------------------------
     print("\n[Step 4] FASTQ Groomer (ensuring Sanger encoding)...")
 
@@ -604,7 +598,6 @@ def main():
 
     # ---------------------------------------------------------------
     # STEP 6: Reverse Complement (reverse reads)
-    # Galaxy step 8
     # ---------------------------------------------------------------
     print("\n[Step 5] Reverse Complementing reverse reads...")
 
@@ -617,7 +610,6 @@ def main():
 
     # ---------------------------------------------------------------
     # STEP 7: Sort reversed collection
-    # Galaxy step 9
     # ---------------------------------------------------------------
     print("\n[Step 6] Sorting reversed collection alphabetically...")
 
@@ -625,7 +617,6 @@ def main():
 
     # ---------------------------------------------------------------
     # STEP 8: Merge Paired-End
-    # Galaxy step 10: seqtk mergepe
     # ---------------------------------------------------------------
     print("\n[Step 7] Merging paired-end reads (interleaved)...")
 
@@ -638,7 +629,6 @@ def main():
 
     # ---------------------------------------------------------------
     # STEP 9: FASTQ Groomer (post-merge)
-    # Galaxy step 11
     # ---------------------------------------------------------------
     print("\n[Step 8] FASTQ Groomer (post-merge encoding fix)...")
 
@@ -649,7 +639,6 @@ def main():
 
     # ---------------------------------------------------------------
     # STEP 10: FASTQ → Tabular
-    # Galaxy step 12
     # ---------------------------------------------------------------
     print("\n[Step 9] FASTQ to Tabular conversion...")
 

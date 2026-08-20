@@ -534,6 +534,10 @@ def main():
         default=0.05,
         help="Quality trimming threshold for seqtk trimfq (default: 0.05, ~Phred 13)"
     )
+    parser.add_argument(
+        "--sample-name",
+        help="Sample name for consensus FASTA header and stats (default: output directory name)"
+    )
     args = parser.parse_args()
 
     # Create output directory
@@ -709,7 +713,7 @@ def main():
             # Use default quality if not available
             aligned_quals.append([20] * len(rec.seq))
 
-    sample_name = os.path.basename(os.path.abspath(work))
+    sample_name = args.sample_name if args.sample_name else os.path.basename(os.path.abspath(work))
     consensus = aligned_to_consensus(aligned_records_1, aligned_with_quals=aligned_quals, sample_name=sample_name)
 
     with open(os.path.join(work, "consensus.fasta"), "w") as f:
@@ -809,7 +813,7 @@ def main():
         quality_rating = "Poor"
 
     stats = {
-        "sample_name": os.path.basename(work),
+        "sample_name": sample_name,
         "forward_file": os.path.basename(forward_ab1_files[0]) if forward_ab1_files else "",
         "reverse_file": os.path.basename(reverse_ab1_files[0]) if reverse_ab1_files else "",
         "forward_raw_length": len(forward_records_raw[0].seq) if forward_records_raw else 0,

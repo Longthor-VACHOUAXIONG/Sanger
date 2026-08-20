@@ -121,7 +121,7 @@ def stream_process(cmd, status_container, progress_bar=None, total_steps=16, tim
     return proc.returncode, "\n".join(log_lines), elapsed
 
 
-def run_workflow(forward_dir, reverse_dir, output_dir, trim_quality=0.05, status_container=None, progress_bar=None):
+def run_workflow(forward_dir, reverse_dir, output_dir, trim_quality=0.05, sample_name=None, status_container=None, progress_bar=None):
     """Run sanger_workflow.py as a subprocess with streaming output."""
     cmd = [
         sys.executable, WORKFLOW_SCRIPT,
@@ -130,6 +130,8 @@ def run_workflow(forward_dir, reverse_dir, output_dir, trim_quality=0.05, status
         "--output", output_dir,
         "--trim-quality", str(trim_quality),
     ]
+    if sample_name:
+        cmd.extend(["--sample-name", sample_name])
     if status_container:
         return stream_process(cmd, status_container, progress_bar=progress_bar, total_steps=16, timeout=600)
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
@@ -326,12 +328,21 @@ if st.button("🚀 Run Workflow", type="primary", disabled=run_disabled):
 
         st.success(f"📁 Saved {len(fwd_paths)} forward + {len(rev_paths)} reverse files")
 
+        sample_name = None
+        if forward_files:
+            stem = Path(forward_files[0].name).stem
+            for suffix in ["_forward", "_Forward", "_fwd", "_F"]:
+                if stem.endswith(suffix):
+                    stem = stem[: -len(suffix)]
+            sample_name = stem
+
         # Run workflow with streaming output
         with st.status("🚀 Running workflow...", expanded=True) as status:
             st.write("Setting up pipeline...")
             progress_bar = st.progress(0, text="Starting...")
             returncode, output, elapsed = run_workflow(
                 fwd_dir, rev_dir, output_dir, trim_quality,
+                sample_name=sample_name,
                 status_container=status, progress_bar=progress_bar,
             )
             if returncode == 0:

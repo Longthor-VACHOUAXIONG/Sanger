@@ -497,7 +497,7 @@ def regex_find_replace_fasta(fasta_str: str) -> str:
 # ===========================================================================
 def main():
     parser = argparse.ArgumentParser(
-        description="Sanger Sequencing Workflow - Python implementation of Galaxy workflow"
+        description="Sanger Sequencing Workflow"
     )
     parser.add_argument(
         "--forward", "-f",
@@ -528,7 +528,7 @@ def main():
 
     print("=" * 70)
     print("SANGER SEQUENCING WORKFLOW")
-    print("Python implementation of Galaxy-Workflow-Sanger.ga")
+    print("Python Sanger Sequencing Data Analysis")
     print("=" * 70)
 
     # ---------------------------------------------------------------
@@ -858,7 +858,7 @@ def main():
         print(f"  {fname:40s} ({size:,} bytes)")
 
     print("\n" + "=" * 70)
-    print("GALAXY WORKFLOW STEP MAPPING:")
+    print("SANGER SEQUENCING WORKFLOW STEP MAPPING:")
     print("=" * 70)
     mapping = [
         ("Steps 0-1", "Input collections", "F/*.ab1, R/*.ab1"),

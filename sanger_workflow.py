@@ -56,6 +56,24 @@ IUPAC = {
     frozenset(["A", "C", "G", "T"]): "N",
 }
 
+IUPAC_EXPANSION = {
+    "A": ["A"],
+    "T": ["T"],
+    "C": ["C"],
+    "G": ["G"],
+    "R": ["A", "G"],
+    "Y": ["C", "T"],
+    "W": ["A", "T"],
+    "S": ["G", "C"],
+    "K": ["G", "T"],
+    "M": ["A", "C"],
+    "B": ["C", "G", "T"],
+    "D": ["A", "G", "T"],
+    "H": ["A", "C", "T"],
+    "V": ["A", "C", "G"],
+    "N": ["A", "C", "G", "T"],
+}
+
 
 # ===========================================================================
 # STEP 1 – AB1 to FASTQ
@@ -419,10 +437,10 @@ def aligned_to_consensus(aligned_records: list, aligned_with_quals: list = None,
 
     Algorithm:
     1. For each alignment column, collect non-gap bases + their quality scores
-    2. Weight each base call by its Phred quality score
-    3. The base with the highest total quality weight wins (no IUPAC codes)
-    4. Skip columns where all sequences have gaps
-    5. Trim leading/trailing columns where coverage < 2 sequences
+    2. Expand IUPAC ambiguity codes to constituent bases (e.g. Y→C/T)
+    3. Weight each base call by its Phred quality score
+    4. The base with the highest total quality weight wins
+    5. Skip columns where all sequences have gaps
     """
     if not aligned_records:
         raise ValueError("No sequences to build consensus from")
@@ -431,13 +449,11 @@ def aligned_to_consensus(aligned_records: list, aligned_with_quals: list = None,
     n_seqs = len(aligned_records)
     use_quality = aligned_with_quals is not None and len(aligned_with_quals) == n_seqs
 
-    # Step 1: Build raw consensus column-by-column
     raw_consensus = []
-    raw_coverage = []  # number of non-gap bases per column
+    raw_coverage = []
 
     for i in range(max_len):
-        # Collect (base, quality_weight) for non-gap bases
-        base_weights = {}  # base -> total quality weight
+        base_weights = {}
         nongap_count = 0
 
         for idx, rec in enumerate(aligned_records):
@@ -449,14 +465,18 @@ def aligned_to_consensus(aligned_records: list, aligned_with_quals: list = None,
 
             nongap_count += 1
 
-            # Get quality weight
             if use_quality and idx < len(aligned_with_quals):
                 quals = aligned_with_quals[idx]
                 weight = max(quals[i], 1) if i < len(quals) else 10
             else:
                 weight = 10
 
-            base_weights[base] = base_weights.get(base, 0) + weight
+            # Expand IUPAC ambiguity codes before voting
+            if base in IUPAC_EXPANSION:
+                for eb in IUPAC_EXPANSION[base]:
+                    base_weights[eb] = base_weights.get(eb, 0) + weight
+            else:
+                base_weights[base] = base_weights.get(base, 0) + weight
 
         raw_coverage.append(nongap_count)
 
@@ -464,13 +484,9 @@ def aligned_to_consensus(aligned_records: list, aligned_with_quals: list = None,
             raw_consensus.append("N")
             continue
 
-        # Pick the base with highest total quality weight
         best_base = max(base_weights, key=base_weights.get)
         raw_consensus.append(best_base)
 
-    # Step 2: No trimming - keep all columns where at least 1 base exists
-    # gaps=false means: skip gap bases in voting, but still include
-    # the position in consensus if any sequence has a base there.
     consensus_seq = Seq("".join(raw_consensus))
     return SeqRecord(consensus_seq, id=sample_name, description="")
 

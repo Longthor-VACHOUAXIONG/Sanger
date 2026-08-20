@@ -241,7 +241,7 @@ with st.sidebar:
 # Main content
 # ---------------------------------------------------------------------------
 
-st.title("🧬 Sanger Sequencing Data Analysis Pipeling")
+st.title("🧬 Sanger Sequencing Data Analysis")
 st.markdown("Upload your AB1 files and run the Sanger pipeline.")
 
 # ---- Mode selection ----

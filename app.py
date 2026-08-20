@@ -366,9 +366,12 @@ if st.button("🚀 Run Workflow", type="primary", disabled=run_disabled):
     st.session_state.run_mode = mode
 
 init_session_state()
-run_mode = st.session_state.run_mode
+returncode = st.session_state.run_returncode
+output = st.session_state.run_output
+elapsed = st.session_state.run_elapsed
 output_dir = st.session_state.run_output_dir
 session_id = st.session_state.run_session_id
+run_mode = st.session_state.run_mode
 
 # ---- Show results ----
 if returncode is not None:

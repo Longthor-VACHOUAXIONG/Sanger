@@ -56,27 +56,31 @@ st.markdown("""
 
 def run_workflow(forward_dir, reverse_dir, output_dir, trim_quality=0.05, sample_name=None, status_container=None, progress_bar=None):
     """Run sanger_workflow.py directly (no subprocess)."""
+    result = workflow_run(forward_dir, reverse_dir, output_dir, trim_quality=trim_quality, sample_name=sample_name)
+    if isinstance(result, tuple) and len(result) == 2:
+        returncode, output = result
+    elif isinstance(result, int):
+        returncode, output = result, ""
+    else:
+        returncode, output = 0, str(result)
     if status_container:
         with st.spinner("Running workflow..."):
-            returncode, output = workflow_run(
-                forward_dir, reverse_dir, output_dir,
-                trim_quality=trim_quality, sample_name=sample_name,
-            )
-        return returncode, output, 0
-    returncode, output = workflow_run(
-        forward_dir, reverse_dir, output_dir,
-        trim_quality=trim_quality, sample_name=sample_name,
-    )
+            pass
     return returncode, output, 0
 
 
 def run_wrapper_batch(upload_dir, output_dir, trim_quality=0.05, status_container=None, progress_bar=None):
     """Run sanger_wrapper.py batch mode directly (no subprocess)."""
+    result = run_batch_workflow(upload_dir, output_dir, trim_quality=trim_quality)
+    if isinstance(result, tuple) and len(result) == 2:
+        returncode, output = result
+    elif isinstance(result, int):
+        returncode, output = result, ""
+    else:
+        returncode, output = 0, str(result)
     if status_container:
         with st.spinner("Running batch processing..."):
-            returncode, output = run_batch_workflow(upload_dir, output_dir, trim_quality=trim_quality)
-        return returncode, output, 0
-    returncode, output = run_batch_workflow(upload_dir, output_dir, trim_quality=trim_quality)
+            pass
     return returncode, output, 0
 
 

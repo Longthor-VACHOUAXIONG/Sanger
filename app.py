@@ -9,6 +9,7 @@ import json
 import shutil
 import tempfile
 import base64
+import traceback
 from pathlib import Path
 from datetime import datetime
 
@@ -16,6 +17,14 @@ import streamlit as st
 
 from sanger_workflow import run_workflow as workflow_run
 from sanger_wrapper import run_batch_workflow
+
+# Global exception handler to show full traceback in Streamlit
+def _excepthook(exc_type, exc_value, exc_tb):
+    st.error(f"Unhandled exception: {exc_type.__name__}: {exc_value}")
+    st.code("".join(traceback.format_exception(exc_type, exc_value, exc_tb)), language="text")
+
+import sys
+sys.excepthook = _excepthook
 
 # ---------------------------------------------------------------------------
 # Config
@@ -303,17 +312,32 @@ if st.button("🚀 Run Workflow", type="primary", disabled=run_disabled):
 
             st.success(f"📁 Saved {len(all_files)} files")
 
-            with st.status("🚀 Running batch processing...", expanded=True) as status:
-                st.write("Auto-detecting pairs...")
-                progress_bar = st.progress(0, text="Starting...")
-                returncode, output, elapsed = run_wrapper_batch(
-                    upload_dir, output_dir, trim_quality,
-                    status_container=status, progress_bar=progress_bar,
-                )
-                if returncode == 0:
-                    status.update(label=f"✅ Batch completed in {elapsed}s", state="complete")
-                else:
-                    status.update(label=f"❌ Batch failed after {elapsed}s", state="error")
+            try:
+                with st.status("🚀 Running batch processing...", expanded=True) as status:
+                    st.write("Auto-detecting pairs...")
+                    progress_bar = st.progress(0, text="Starting...")
+                    result = run_wrapper_batch(
+                        upload_dir, output_dir, trim_quality,
+                        status_container=status, progress_bar=progress_bar,
+                    )
+                    if isinstance(result, tuple) and len(result) == 3:
+                        returncode, output, elapsed = result
+                    elif isinstance(result, tuple) and len(result) == 2:
+                        returncode, output = result
+                        elapsed = 0
+                    elif isinstance(result, int):
+                        returncode, output, elapsed = result, "", 0
+                    else:
+                        returncode, output, elapsed = 0, str(result), 0
+                    if returncode == 0:
+                        status.update(label=f"✅ Batch completed in {elapsed}s", state="complete")
+                    else:
+                        status.update(label=f"❌ Batch failed after {elapsed}s", state="error")
+            except Exception as e:
+                import traceback
+                returncode = 1
+                output = f"Error: {e}\n" + traceback.format_exc()
+                elapsed = 0
 
     st.session_state.run_returncode = returncode
     st.session_state.run_output = output

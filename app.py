@@ -209,9 +209,9 @@ def cleanup_session(session_id):
 # ---------------------------------------------------------------------------
 
 with st.sidebar:
-    st.title("🧬 Sanger Sequencing Pipeline")
+    st.title("🧬 Sanger Sequencing")
     st.markdown("---")
-    st.markdown("**Pipeline:** Sanger Sequencing Data Analysis Pipeline")
+    st.markdown("**Pipeline:** Sanger Sequencing Data Analysis")
     st.markdown("**Steps:**")
     st.markdown("""
     1. AB1 → FASTQ conversion
@@ -495,6 +495,6 @@ if st.button("🚀 Run Workflow", type="primary", disabled=run_disabled):
 # ---- Footer ----
 st.markdown("---")
 st.markdown(
-    "Sanger Sequencing Data Analysis Pipeline",
+    "Sanger Sequencing Data Analysis",
     help="Upload AB1 files, run the pipeline, and download results."
 )

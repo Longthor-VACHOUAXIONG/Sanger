@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Sanger Sequencing Workflow - Web App
+Sanger Sequencing Data analysis workflow
 Streamlit interface for uploading AB1 files, running the pipeline, and viewing results.
 """
 
@@ -241,7 +241,7 @@ with st.sidebar:
 # Main content
 # ---------------------------------------------------------------------------
 
-st.title("🧬 Sanger Sequencing Workflow")
+st.title("🧬 Sanger Sequencing Data Analysis")
 st.markdown("Upload your AB1 files and run the Sanger pipeline.")
 
 # ---- Mode selection ----
@@ -495,6 +495,6 @@ if st.button("🚀 Run Workflow", type="primary", disabled=run_disabled):
 # ---- Footer ----
 st.markdown("---")
 st.markdown(
-    "Sanger Workflow",
+    "Sanger Sequencing Data Analysis Workflow",
     help="Upload AB1 files, run the pipeline, and download results."
 )

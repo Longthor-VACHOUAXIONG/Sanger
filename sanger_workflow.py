@@ -281,7 +281,6 @@ def sort_records_alpha(records: list) -> list:
 # ===========================================================================
 def fastq_groomer(records: list) -> list:
     """
-    Equivalent to Galaxy FASTQ Groomer (sanger → sanger).
     Ensures quality values are in Sanger (Phred+33) encoding
     and fixes IDs to match the sequence.
     """

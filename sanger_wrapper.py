@@ -41,8 +41,12 @@ import glob
 import argparse
 import shutil
 import tempfile
+import io
+import contextlib
 from pathlib import Path
 from collections import defaultdict
+
+from sanger_workflow import run_workflow as workflow_run
 
 
 # ---------------------------------------------------------------------------
@@ -212,22 +216,80 @@ def cleanup_temp_dirs(*dirs):
             shutil.rmtree(d, ignore_errors=True)
 
 
-def run_workflow(forward_dir, reverse_dir, output_dir, trim_quality=0.05):
-    """Run the sanger_workflow.py script with given parameters."""
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    workflow_script = os.path.join(script_dir, "sanger_workflow.py")
+def run_workflow(forward_dir, reverse_dir, output_dir, trim_quality=0.05, sample_name=None):
+    """Run the sanger_workflow.py script directly (no subprocess)."""
+    rc, output = workflow_run(forward_dir, reverse_dir, output_dir, trim_quality=trim_quality, sample_name=sample_name)
+    if output:
+        print(output)
+    return rc
 
-    cmd = [
-        sys.executable, workflow_script,
-        "--forward", forward_dir,
-        "--reverse", reverse_dir,
-        "--output", output_dir,
-        "--trim-quality", str(trim_quality),
-    ]
 
-    print(f"\n  Running: {' '.join(cmd)}\n")
-    result = os.spawnvp(os.P_WAIT, sys.executable, [sys.executable] + cmd[1:])
-    return result
+def run_batch_workflow(auto_dir, output_dir, trim_quality=0.05):
+    """
+    Auto-detect pairs from a directory and run the workflow for each pair.
+
+    Returns (returncode, output_string).
+    """
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        try:
+            print("=" * 70)
+            print("SANGER WORKFLOW WRAPPER")
+            print("=" * 70)
+
+            print(f"\nMode: Auto-detect from {auto_dir}/")
+
+            all_files = find_ab1_files([auto_dir])
+            if not all_files:
+                print(f"\n  ERROR: No .ab1 files found in {auto_dir}/")
+                return 1, buf.getvalue()
+
+            print(f"  Found {len(all_files)} AB1 files")
+
+            forward, reverse, unmatched = auto_pair_files(all_files)
+            paired_samples = print_detection_report(forward, reverse, unmatched)
+
+            if not paired_samples:
+                print("\n  ERROR: No valid forward/reverse pairs found!")
+                print("  Tip: Use naming convention like sample_forward.ab1 / sample_reverse.ab1")
+                return 1, buf.getvalue()
+
+            for sample in sorted(paired_samples):
+                sample_dir = os.path.join(output_dir, sample)
+                os.makedirs(sample_dir, exist_ok=True)
+                tmp_fwd, tmp_rev = prepare_temp_dirs([forward[sample]], [reverse[sample]], sample_dir)
+                try:
+                    rc, wf_output = run_workflow(tmp_fwd, tmp_rev, sample_dir, trim_quality=trim_quality, sample_name=sample)
+                    if wf_output:
+                        print(wf_output)
+                    if rc != 0:
+                        return rc, buf.getvalue()
+                finally:
+                    cleanup_temp_dirs(tmp_fwd, tmp_rev)
+
+            print("\n" + "=" * 70)
+            print("GENERATING QUALITY REPORT")
+            print("=" * 70)
+
+            stats = collect_sample_stats(output_dir)
+            if stats:
+                generate_html_report(output_dir, stats)
+            else:
+                print("  No sample_stats.json found - report skipped.")
+
+            print("\n  Combining all consensus sequences...")
+            combine_consensus_files(output_dir)
+
+            print("\n" + "=" * 70)
+            print("DONE!")
+            print("=" * 70)
+            return 0, buf.getvalue()
+
+        except Exception as e:
+            import traceback
+            print(f"ERROR: {e}")
+            traceback.print_exc()
+            return 1, buf.getvalue()
 
 
 def collect_sample_stats(output_dir):

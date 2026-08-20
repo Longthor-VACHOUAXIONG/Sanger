@@ -5,27 +5,24 @@ Streamlit interface for uploading AB1 files, running the pipeline, and viewing r
 """
 
 import os
-import sys
 import json
 import shutil
 import tempfile
-import subprocess
 import base64
 from pathlib import Path
 from datetime import datetime
 
 import streamlit as st
 
+from sanger_workflow import run_workflow as workflow_run
+from sanger_wrapper import run_batch_workflow
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-WORKFLOW_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sanger_workflow.py")
-WRAPPER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sanger_wrapper.py")
-TEMP_UPLOAD_DIR = os.path.join(tempfile.gettempdir(), "sanger_uploads")
 OUTPUT_BASE = os.path.join(tempfile.gettempdir(), "sanger_output")
 
-# Ensure temp dirs exist
-os.makedirs(TEMP_UPLOAD_DIR, exist_ok=True)
+# Ensure base output dir exists
 os.makedirs(OUTPUT_BASE, exist_ok=True)
 
 
@@ -57,99 +54,30 @@ st.markdown("""
 # Helper functions
 # ---------------------------------------------------------------------------
 
-def save_uploaded_files(files, subfolder):
-    """Save uploaded files to a temporary directory."""
-    upload_dir = os.path.join(TEMP_UPLOAD_DIR, subfolder)
-    os.makedirs(upload_dir, exist_ok=True)
-    saved = []
-    for f in files:
-        path = os.path.join(upload_dir, f.name)
-        with open(path, "wb") as out:
-            out.write(f.getbuffer())
-        saved.append(path)
-    return upload_dir, saved
-
-
-def stream_process(cmd, status_container, progress_bar=None, total_steps=16, timeout=3600):
-    """Run a subprocess and stream output line by line into a Streamlit status container."""
-    import re
-    import time
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        bufsize=1,
-    )
-    log_lines = []
-    last_update = 0
-    current_step = 0
-    start_time = time.time()
-
-    for line in iter(proc.stdout.readline, ""):
-        line = line.rstrip()
-        if not line:
-            continue
-        log_lines.append(line)
-        # Write line to status container
-        status_container.write(f"`{line}`")
-
-        # Detect step number from [Step X] pattern
-        m = re.search(r"\[Step (\d+)\]", line)
-        if m:
-            step_num = int(m.group(1))
-            if step_num != current_step:
-                current_step = step_num
-                pct = min(current_step / total_steps, 1.0)
-                if progress_bar:
-                    progress_bar.progress(pct, text=f"Step {current_step}/{total_steps}")
-
-        # Update label periodically
-        now = time.time()
-        if now - last_update >= 1.0:
-            elapsed = int(now - start_time)
-            status_container.update(label=f"Running... ({elapsed}s elapsed, step {current_step}/{total_steps})", state="running")
-            last_update = now
-
-    # Final progress update
-    if progress_bar:
-        progress_bar.progress(1.0, text="Complete!")
-
-    proc.wait(timeout=timeout)
-    elapsed = int(time.time() - start_time)
-    return proc.returncode, "\n".join(log_lines), elapsed
-
-
 def run_workflow(forward_dir, reverse_dir, output_dir, trim_quality=0.05, sample_name=None, status_container=None, progress_bar=None):
-    """Run sanger_workflow.py as a subprocess with streaming output."""
-    cmd = [
-        sys.executable, WORKFLOW_SCRIPT,
-        "--forward", forward_dir,
-        "--reverse", reverse_dir,
-        "--output", output_dir,
-        "--trim-quality", str(trim_quality),
-    ]
-    if sample_name:
-        cmd.extend(["--sample-name", sample_name])
+    """Run sanger_workflow.py directly (no subprocess)."""
     if status_container:
-        return stream_process(cmd, status_container, progress_bar=progress_bar, total_steps=16, timeout=600)
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-    return result.returncode, result.stdout + result.stderr, 0
+        with st.spinner("Running workflow..."):
+            returncode, output = workflow_run(
+                forward_dir, reverse_dir, output_dir,
+                trim_quality=trim_quality, sample_name=sample_name,
+            )
+        return returncode, output, 0
+    returncode, output = workflow_run(
+        forward_dir, reverse_dir, output_dir,
+        trim_quality=trim_quality, sample_name=sample_name,
+    )
+    return returncode, output, 0
 
 
 def run_wrapper_batch(upload_dir, output_dir, trim_quality=0.05, status_container=None, progress_bar=None):
-    """Run sanger_wrapper.py in auto-dir mode with streaming output."""
-    cmd = [
-        sys.executable, WRAPPER_SCRIPT,
-        "--auto-dir", upload_dir,
-        "-o", output_dir,
-        "-q", str(trim_quality),
-    ]
+    """Run sanger_wrapper.py batch mode directly (no subprocess)."""
     if status_container:
-        return stream_process(cmd, status_container, progress_bar=progress_bar, total_steps=16, timeout=3600)
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-    return result.returncode, result.stdout + result.stderr, 0
+        with st.spinner("Running batch processing..."):
+            returncode, output = run_batch_workflow(upload_dir, output_dir, trim_quality=trim_quality)
+        return returncode, output, 0
+    returncode, output = run_batch_workflow(upload_dir, output_dir, trim_quality=trim_quality)
+    return returncode, output, 0
 
 
 def load_sample_stats(output_dir):
@@ -200,18 +128,9 @@ def get_download_link(filepath, filename=None):
 
 def cleanup_session(session_id):
     """Clean up temp files for a session."""
-    upload_dir = os.path.join(TEMP_UPLOAD_DIR, session_id)
     output_dir = os.path.join(OUTPUT_BASE, session_id)
-    for d in [upload_dir, output_dir]:
-        if os.path.exists(d):
-            shutil.rmtree(d, ignore_errors=True)
-
-
-def cleanup_uploaded_files(session_id):
-    """Clean up only the uploaded files, keeping workflow results."""
-    upload_dir = os.path.join(TEMP_UPLOAD_DIR, session_id)
-    if os.path.exists(upload_dir):
-        shutil.rmtree(upload_dir, ignore_errors=True)
+    if os.path.exists(output_dir):
+        shutil.rmtree(output_dir, ignore_errors=True)
 
 
 def init_session_state():
@@ -327,66 +246,71 @@ else:
 if st.button("🚀 Run Workflow", type="primary", disabled=run_disabled):
     session_id = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     output_dir = os.path.join(OUTPUT_BASE, session_id)
+    os.makedirs(output_dir, exist_ok=True)
 
-    with st.spinner("Setting up..."):
-        cleanup_session(session_id)
+    with tempfile.TemporaryDirectory(prefix="sanger_uploads_") as upload_tmp:
+        returncode = None
+        output = ""
+        elapsed = 0
 
-    returncode = None
-    output = ""
-    elapsed = 0
+        if mode == "Single pair":
+            fwd_dir = os.path.join(upload_tmp, "forward")
+            rev_dir = os.path.join(upload_tmp, "reverse")
+            os.makedirs(fwd_dir, exist_ok=True)
+            os.makedirs(rev_dir, exist_ok=True)
 
-    if mode == "Single pair":
-        # Save uploaded files
-        fwd_dir, fwd_paths = save_uploaded_files(forward_files, f"{session_id}/forward")
-        rev_dir, rev_paths = save_uploaded_files(reverse_files, f"{session_id}/reverse")
+            for f in forward_files:
+                with open(os.path.join(fwd_dir, f.name), "wb") as out:
+                    out.write(f.getbuffer())
+            for f in reverse_files:
+                with open(os.path.join(rev_dir, f.name), "wb") as out:
+                    out.write(f.getbuffer())
 
-        st.success(f"📁 Saved {len(fwd_paths)} forward + {len(rev_paths)} reverse files")
+            st.success(f"📁 Saved {len(forward_files)} forward + {len(reverse_files)} reverse files")
 
-        sample_name = None
-        if forward_files:
-            stem = Path(forward_files[0].name).stem
-            for suffix in ["_forward", "_Forward", "_fwd", "_F"]:
-                if stem.endswith(suffix):
-                    stem = stem[: -len(suffix)]
-            sample_name = stem
+            sample_name = None
+            if forward_files:
+                stem = Path(forward_files[0].name).stem
+                for suffix in ["_forward", "_Forward", "_fwd", "_F"]:
+                    if stem.endswith(suffix):
+                        stem = stem[: -len(suffix)]
+                sample_name = stem
 
-        # Run workflow with streaming output
-        with st.status("🚀 Running workflow...", expanded=True) as status:
-            st.write("Setting up pipeline...")
-            progress_bar = st.progress(0, text="Starting...")
-            returncode, output, elapsed = run_workflow(
-                fwd_dir, rev_dir, output_dir, trim_quality,
-                sample_name=sample_name,
-                status_container=status, progress_bar=progress_bar,
-            )
-            if returncode == 0:
-                status.update(label=f"✅ Workflow completed in {elapsed}s", state="complete")
-            else:
-                status.update(label=f"❌ Workflow failed after {elapsed}s", state="error")
+            with st.status("🚀 Running workflow...", expanded=True) as status:
+                st.write("Setting up pipeline...")
+                progress_bar = st.progress(0, text="Starting...")
+                returncode, output, elapsed = run_workflow(
+                    fwd_dir, rev_dir, output_dir, trim_quality,
+                    sample_name=sample_name,
+                    status_container=status, progress_bar=progress_bar,
+                )
+                if returncode == 0:
+                    status.update(label=f"✅ Workflow completed in {elapsed}s", state="complete")
+                else:
+                    status.update(label=f"❌ Workflow failed after {elapsed}s", state="error")
 
-        cleanup_uploaded_files(session_id)
+        else:
+            upload_dir = os.path.join(upload_tmp, session_id)
+            os.makedirs(upload_dir, exist_ok=True)
 
-    else:
-        # Save all files to one directory
-        upload_dir, saved_paths = save_uploaded_files(all_files, session_id)
-        st.success(f"📁 Saved {len(saved_paths)} files")
+            for f in all_files:
+                with open(os.path.join(upload_dir, f.name), "wb") as out:
+                    out.write(f.getbuffer())
 
-        # Run wrapper with streaming output
-        with st.status("🚀 Running batch processing...", expanded=True) as status:
-            st.write("Auto-detecting pairs...")
-            progress_bar = st.progress(0, text="Starting...")
-            returncode, output, elapsed = run_wrapper_batch(
-                upload_dir, output_dir, trim_quality,
-                status_container=status, progress_bar=progress_bar,
-            )
-            if returncode == 0:
-                status.update(label=f"✅ Batch completed in {elapsed}s", state="complete")
-            else:
-                status.update(label=f"❌ Batch failed after {elapsed}s", state="error")
+            st.success(f"📁 Saved {len(all_files)} files")
 
-        cleanup_uploaded_files(session_id)
+            with st.status("🚀 Running batch processing...", expanded=True) as status:
+                st.write("Auto-detecting pairs...")
+                progress_bar = st.progress(0, text="Starting...")
+                returncode, output, elapsed = run_wrapper_batch(
+                    upload_dir, output_dir, trim_quality,
+                    status_container=status, progress_bar=progress_bar,
+                )
+                if returncode == 0:
+                    status.update(label=f"✅ Batch completed in {elapsed}s", state="complete")
+                else:
+                    status.update(label=f"❌ Batch failed after {elapsed}s", state="error")
 
-    # Persist results in session state so they survive reruns
     st.session_state.run_returncode = returncode
     st.session_state.run_output = output
     st.session_state.run_elapsed = elapsed

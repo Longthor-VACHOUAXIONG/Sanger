@@ -509,6 +509,295 @@ def regex_find_replace_fasta(fasta_str: str) -> str:
 # ===========================================================================
 # MAIN WORKFLOW
 # ===========================================================================
+def run_workflow(forward_dir, reverse_dir, output_dir, trim_quality=0.05, sample_name=None):
+    """
+    Run the Sanger sequencing workflow.
+
+    Returns (returncode, output_string).
+    """
+    import io
+    import contextlib
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            work = output_dir
+
+            print("=" * 70)
+            print("SANGER SEQUENCING WORKFLOW")
+            print("Python Sanger Sequencing Data Analysis")
+            print("=" * 70)
+
+            print("\n[Step 1] Reading AB1 files and converting to FASTQ...")
+            forward_ab1_files = sorted(glob.glob(os.path.join(forward_dir, "*.ab1")))
+            reverse_ab1_files = sorted(glob.glob(os.path.join(reverse_dir, "*.ab1")))
+
+            if not forward_ab1_files:
+                print(f"ERROR: No .ab1 files found in {forward_dir}/")
+                return 1, buf.getvalue()
+            if not reverse_ab1_files:
+                print(f"ERROR: No .ab1 files found in {reverse_dir}/")
+                return 1, buf.getvalue()
+
+            print(f"  Forward files: {len(forward_ab1_files)}")
+            print(f"  Reverse files: {len(reverse_ab1_files)}")
+
+            forward_records_raw = [ab1_to_fastq(f) for f in forward_ab1_files]
+            reverse_records_raw = [ab1_to_fastq(f) for f in reverse_ab1_files]
+
+            with open(os.path.join(work, "forward_raw.fastq"), "w") as f:
+                f.write(records_to_fastq_string(forward_records_raw))
+            with open(os.path.join(work, "reverse_raw.fastq"), "w") as f:
+                f.write(records_to_fastq_string(reverse_records_raw))
+
+            print(f"  → forward_raw.fastq ({len(forward_records_raw)} sequences)")
+            print(f"  → reverse_raw.fastq ({len(reverse_records_raw)} sequences)")
+
+            print(f"\n[Step 2] Quality trimming (q={trim_quality}, Phred≥{int(-10*math.log10(trim_quality))})...")
+            forward_trimmed = trimfq_quality(forward_records_raw, q=trim_quality)
+            reverse_trimmed = trimfq_quality(reverse_records_raw, q=trim_quality)
+
+            print(f"  Forward: {len(forward_records_raw[0].seq)} → {len(forward_trimmed[0].seq)} bases (avg)")
+            print(f"  Reverse: {len(reverse_records_raw[0].seq)} → {len(reverse_trimmed[0].seq)} bases (avg)")
+
+            with open(os.path.join(work, "forward_trimmed.fastq"), "w") as f:
+                f.write(records_to_fastq_string(forward_trimmed))
+            with open(os.path.join(work, "reverse_trimmed.fastq"), "w") as f:
+                f.write(records_to_fastq_string(reverse_trimmed))
+
+            print("\n[Step 3] Sorting collections alphabetically...")
+            forward_sorted = sort_records_alpha(forward_trimmed)
+            reverse_sorted = sort_records_alpha(reverse_trimmed)
+
+            print(f"  Forward order: {[r.id for r in forward_sorted]}")
+            print(f"  Reverse order: {[r.id for r in reverse_sorted]}")
+
+            print("\n[Step 4] FASTQ Groomer (ensuring Sanger encoding)...")
+            reverse_groomed = fastq_groomer(reverse_sorted)
+
+            with open(os.path.join(work, "reverse_groomed.fastq"), "w") as f:
+                f.write(records_to_fastq_string(reverse_groomed))
+
+            print("\n[Step 5] Reverse Complementing reverse reads...")
+            reverse_rc = reverse_complement_records(reverse_groomed)
+
+            with open(os.path.join(work, "reverse_complement.fastq"), "w") as f:
+                f.write(records_to_fastq_string(reverse_rc))
+
+            print(f"  RC first seq: {str(reverse_rc[0].seq[:50])}...")
+
+            print("\n[Step 6] Sorting reversed collection alphabetically...")
+            reverse_rc_sorted = sort_records_alpha(reverse_rc)
+
+            print("\n[Step 7] Merging paired-end reads (interleaved)...")
+            merged = mergepe_interleaved(forward_sorted, reverse_rc_sorted)
+
+            with open(os.path.join(work, "merged_interleaved.fastq"), "w") as f:
+                f.write(records_to_fastq_string(merged))
+
+            print(f"  Merged {len(merged)} records ({len(merged)//2} pairs)")
+
+            print("\n[Step 8] FASTQ Groomer (post-merge encoding fix)...")
+            merged_groomed = fastq_groomer(merged)
+
+            with open(os.path.join(work, "merged_groomed.fastq"), "w") as f:
+                f.write(records_to_fastq_string(merged_groomed))
+
+            print("\n[Step 9] FASTQ to Tabular conversion...")
+            tabular = fastq_to_tabular(merged_groomed)
+
+            with open(os.path.join(work, "merged.tabular"), "w") as f:
+                f.write(tabular)
+
+            tab_lines = tabular.strip().split("\n")
+            print(f"  {len(tab_lines)} tabular records created")
+
+            print("\n[Step 10] Tabular to FASTA conversion...")
+            fasta_records = tabular_to_fasta(tabular)
+
+            with open(os.path.join(work, "merged.fasta"), "w") as f:
+                SeqIO.write(fasta_records, f, "fasta")
+
+            print(f"  {len(fasta_records)} FASTA sequences created")
+
+            print("\n[Step 11] MAFFT alignment (first pass)...")
+            aligned_records_1, log1 = mafft_align(fasta_records)
+
+            with open(os.path.join(work, "aligned.fasta"), "w") as f:
+                SeqIO.write(aligned_records_1, f, "fasta")
+            with open(os.path.join(work, "alignment_log_1.txt"), "w") as f:
+                f.write(log1)
+
+            print(f"  Aligned {len(aligned_records_1)} sequences")
+            print(f"  Alignment length: {len(aligned_records_1[0].seq)} bp")
+
+            print("\n[Step 12] Building consensus sequence (quality-weighted chr_ambiguity)...")
+            aligned_quals = []
+            for rec in aligned_records_1:
+                quals = rec.letter_annotations.get("phred_quality", [])
+                if quals:
+                    aligned_quals.append(quals)
+                else:
+                    aligned_quals.append([20] * len(rec.seq))
+
+            consensus_name = sample_name if sample_name else os.path.basename(os.path.abspath(work))
+            consensus = aligned_to_consensus(aligned_records_1, aligned_with_quals=aligned_quals, sample_name=consensus_name)
+
+            with open(os.path.join(work, "consensus.fasta"), "w") as f:
+                SeqIO.write([consensus], f, "fasta")
+
+            print(f"  Consensus length: {len(consensus.seq)} bp")
+            print(f"  First 80 bp: {str(consensus.seq[:80])}")
+
+            print("\n[Step 13] Merge.files (combining consensus + aligned sequences)...")
+            all_sequences = aligned_records_1 + [consensus]
+
+            with open(os.path.join(work, "all_sequences.fasta"), "w") as f:
+                SeqIO.write(all_sequences, f, "fasta")
+
+            print(f"  Total sequences: {len(all_sequences)} ({len(aligned_records_1)} aligned + 1 consensus)")
+
+            print("\n[Step 14] Regex Find And Replace (formatting FASTA headers)...")
+            fasta_str = ""
+            for rec in all_sequences:
+                fasta_str += f">{rec.id}\n{str(rec.seq)}\n"
+
+            formatted_fasta = regex_find_replace_fasta(fasta_str)
+
+            with open(os.path.join(work, "formatted_sequences.fasta"), "w") as f:
+                f.write(formatted_fasta)
+
+            print("\n[Step 15] MAFFT alignment (final pass on formatted sequences)...")
+            formatted_records = list(SeqIO.parse(io.StringIO(formatted_fasta), "fasta"))
+
+            aligned_records_final, log2 = mafft_align(formatted_records)
+
+            with open(os.path.join(work, "final_aligned.fasta"), "w") as f:
+                SeqIO.write(aligned_records_final, f, "fasta")
+            with open(os.path.join(work, "alignment_log_2.txt"), "w") as f:
+                f.write(log2)
+
+            print(f"  Final alignment: {len(aligned_records_final)} sequences, {len(aligned_records_final[0].seq)} bp")
+
+            print("\n[Step 16] Computing quality statistics...")
+            consensus_seq = str(consensus.seq).upper()
+            consensus_len = len(consensus_seq)
+
+            base_counts = Counter(consensus_seq)
+            valid_bases = sum(base_counts[b] for b in "ATCG")
+            ambiguous_bases = sum(base_counts[b] for b in "RYSWKMBDHVN")
+            n_bases = base_counts.get("N", 0)
+            gap_bases = base_counts.get("-", 0) + base_counts.get(".", 0)
+
+            gc_count = base_counts.get("G", 0) + base_counts.get("C", 0)
+            gc_content = (gc_count / valid_bases * 100) if valid_bases > 0 else 0.0
+            ambiguity_pct = (ambiguous_bases / consensus_len * 100) if consensus_len > 0 else 0.0
+            n_pct = (n_bases / consensus_len * 100) if consensus_len > 0 else 0.0
+            gap_pct = (gap_bases / consensus_len * 100) if consensus_len > 0 else 0.0
+            coverage_pct = (valid_bases / consensus_len * 100) if consensus_len > 0 else 0.0
+
+            all_fwd_quals = []
+            for rec in forward_records_raw:
+                all_fwd_quals.extend(rec.letter_annotations.get("phred_quality", []))
+            all_rev_quals = []
+            for rec in reverse_records_raw:
+                all_rev_quals.extend(rec.letter_annotations.get("phred_quality", []))
+
+            fwd_avg_qual = sum(all_fwd_quals) / len(all_fwd_quals) if all_fwd_quals else 0
+            rev_avg_qual = sum(all_rev_quals) / len(all_rev_quals) if all_rev_quals else 0
+            fwd_min_qual = min(all_fwd_quals) if all_fwd_quals else 0
+            rev_min_qual = min(all_rev_quals) if all_rev_quals else 0
+
+            if ambiguity_pct < 1 and n_pct < 1:
+                quality_rating = "Excellent"
+            elif ambiguity_pct < 3 and n_pct < 3:
+                quality_rating = "Good"
+            elif ambiguity_pct < 5 and n_pct < 5:
+                quality_rating = "Fair"
+            else:
+                quality_rating = "Poor"
+
+            stats = {
+                "sample_name": consensus_name,
+                "forward_file": os.path.basename(forward_ab1_files[0]) if forward_ab1_files else "",
+                "reverse_file": os.path.basename(reverse_ab1_files[0]) if reverse_ab1_files else "",
+                "forward_raw_length": len(forward_records_raw[0].seq) if forward_records_raw else 0,
+                "reverse_raw_length": len(reverse_records_raw[0].seq) if reverse_records_raw else 0,
+                "forward_trimmed_length": len(forward_trimmed[0].seq) if forward_trimmed else 0,
+                "reverse_trimmed_length": len(reverse_trimmed[0].seq) if reverse_trimmed else 0,
+                "alignment_length": len(aligned_records_1[0].seq) if aligned_records_1 else 0,
+                "consensus_length": consensus_len,
+                "valid_bases": valid_bases,
+                "ambiguous_bases": ambiguous_bases,
+                "n_bases": n_bases,
+                "gap_bases": gap_bases,
+                "gc_content": round(gc_content, 2),
+                "ambiguity_pct": round(ambiguity_pct, 2),
+                "n_pct": round(n_pct, 2),
+                "gap_pct": round(gap_pct, 2),
+                "coverage_pct": round(coverage_pct, 2),
+                "forward_avg_quality": round(fwd_avg_qual, 1),
+                "reverse_avg_quality": round(rev_avg_qual, 1),
+                "forward_min_quality": fwd_min_qual,
+                "reverse_min_quality": rev_min_qual,
+                "quality_rating": quality_rating,
+                "num_sequences_aligned": len(aligned_records_1),
+            }
+
+            stats_path = os.path.join(work, "sample_stats.json")
+            with open(stats_path, "w") as f:
+                json.dump(stats, f, indent=2)
+
+            print(f"  Quality rating: {quality_rating}")
+            print(f"  Consensus: {consensus_len} bp, GC: {gc_content:.1f}%, Ambiguity: {ambiguity_pct:.1f}%")
+            print(f"  → sample_stats.json")
+
+            print("\n" + "=" * 70)
+            print("WORKFLOW COMPLETE!")
+            print("=" * 70)
+            print(f"\nOutput directory: {os.path.abspath(work)}/")
+            print("\nFiles produced:")
+            for fname in sorted(os.listdir(work)):
+                fpath = os.path.join(work, fname)
+                size = os.path.getsize(fpath)
+                print(f"  {fname:40s} ({size:,} bytes)")
+
+            print("\n" + "=" * 70)
+            print("WORKFLOW STEP SUMMARY:")
+            print("=" * 70)
+            print(f"  {'Step':12s} | {'Tool':30s} | {'Output'}")
+            print(f"  {'-'*12}-+-{'-'*30}-+-{'-'*30}")
+            steps = [
+                ("Steps 1-2", "AB1 to FASTQ", "forward_raw.fastq, reverse_raw.fastq"),
+                ("Step 3", "Quality trimming", "forward_trimmed.fastq, reverse_trimmed.fastq"),
+                ("Step 4", "Sort collection", "sorted in memory"),
+                ("Step 5", "FASTQ Groomer", "reverse_groomed.fastq"),
+                ("Step 6", "Reverse-Complement", "reverse_complement.fastq"),
+                ("Step 7", "Sort collection", "sorted in memory"),
+                ("Step 8", "Merge paired-end", "merged_interleaved.fastq"),
+                ("Step 9", "FASTQ Groomer", "merged_groomed.fastq"),
+                ("Step 10", "FASTQ to Tabular", "merged.tabular"),
+                ("Step 11", "Tabular-to-FASTA", "merged.fasta"),
+                ("Step 12", "MAFFT alignment", "aligned.fasta"),
+                ("Step 13", "Consensus", "consensus.fasta"),
+                ("Steps 14-15", "Merge files", "all_sequences.fasta"),
+                ("Step 16", "Regex format", "formatted_sequences.fasta"),
+                ("Step 17", "MAFFT alignment", "final_aligned.fasta"),
+            ]
+            for step, tool, output in steps:
+                print(f"  {step:12s} | {tool:30s} | {output}")
+
+            print("\nDone!")
+            return 0, buf.getvalue()
+
+        except Exception as e:
+            import traceback
+            print(f"ERROR: {e}")
+            traceback.print_exc()
+            return 1, buf.getvalue()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Sanger Sequencing Workflow"
@@ -540,352 +829,12 @@ def main():
     )
     args = parser.parse_args()
 
-    # Create output directory
-    os.makedirs(args.output, exist_ok=True)
-    work = args.output  # shorthand
-
-    print("=" * 70)
-    print("SANGER SEQUENCING WORKFLOW")
-    print("Python Sanger Sequencing Data Analysis")
-    print("=" * 70)
-
-    # ---------------------------------------------------------------
-    # STEP 1 & 2: AB1 → FASTQ conversion (Forward & Reverse)
-    # ---------------------------------------------------------------
-    print("\n[Step 1] Reading AB1 files and converting to FASTQ...")
-
-    forward_ab1_files = sorted(glob.glob(os.path.join(args.forward, "*.ab1")))
-    reverse_ab1_files = sorted(glob.glob(os.path.join(args.reverse, "*.ab1")))
-
-    if not forward_ab1_files:
-        print(f"ERROR: No .ab1 files found in {args.forward}/")
-        sys.exit(1)
-    if not reverse_ab1_files:
-        print(f"ERROR: No .ab1 files found in {args.reverse}/")
-        sys.exit(1)
-
-    print(f"  Forward files: {len(forward_ab1_files)}")
-    print(f"  Reverse files: {len(reverse_ab1_files)}")
-
-    forward_records_raw = [ab1_to_fastq(f) for f in forward_ab1_files]
-    reverse_records_raw = [ab1_to_fastq(f) for f in reverse_ab1_files]
-
-    # Write raw FASTQ
-    with open(os.path.join(work, "forward_raw.fastq"), "w") as f:
-        f.write(records_to_fastq_string(forward_records_raw))
-    with open(os.path.join(work, "reverse_raw.fastq"), "w") as f:
-        f.write(records_to_fastq_string(reverse_records_raw))
-
-    print(f"  → forward_raw.fastq ({len(forward_records_raw)} sequences)")
-    print(f"  → reverse_raw.fastq ({len(reverse_records_raw)} sequences)")
-
-    # ---------------------------------------------------------------
-    # STEP 3: Quality Trimming (seqtk trimfq -q 0.05)
-    # ---------------------------------------------------------------
-    print(f"\n[Step 2] Quality trimming (q={args.trim_quality}, Phred≥{int(-10*math.log10(args.trim_quality))})...")
-
-    forward_trimmed = trimfq_quality(forward_records_raw, q=args.trim_quality)
-    reverse_trimmed = trimfq_quality(reverse_records_raw, q=args.trim_quality)
-
-    print(f"  Forward: {len(forward_records_raw[0].seq)} → {len(forward_trimmed[0].seq)} bases (avg)")
-    print(f"  Reverse: {len(reverse_records_raw[0].seq)} → {len(reverse_trimmed[0].seq)} bases (avg)")
-
-    with open(os.path.join(work, "forward_trimmed.fastq"), "w") as f:
-        f.write(records_to_fastq_string(forward_trimmed))
-    with open(os.path.join(work, "reverse_trimmed.fastq"), "w") as f:
-        f.write(records_to_fastq_string(reverse_trimmed))
-
-    # ---------------------------------------------------------------
-    # STEP 4: Sort collections alphabetically
-    # ---------------------------------------------------------------
-    print("\n[Step 3] Sorting collections alphabetically...")
-
-    forward_sorted = sort_records_alpha(forward_trimmed)
-    reverse_sorted = sort_records_alpha(reverse_trimmed)
-
-    print(f"  Forward order: {[r.id for r in forward_sorted]}")
-    print(f"  Reverse order: {[r.id for r in reverse_sorted]}")
-
-    # ---------------------------------------------------------------
-    # STEP 5: FASTQ Groomer (reverse reads → fastqsanger)
-    # ---------------------------------------------------------------
-    print("\n[Step 4] FASTQ Groomer (ensuring Sanger encoding)...")
-
-    reverse_groomed = fastq_groomer(reverse_sorted)
-
-    with open(os.path.join(work, "reverse_groomed.fastq"), "w") as f:
-        f.write(records_to_fastq_string(reverse_groomed))
-
-    # ---------------------------------------------------------------
-    # STEP 6: Reverse Complement (reverse reads)
-    # ---------------------------------------------------------------
-    print("\n[Step 5] Reverse Complementing reverse reads...")
-
-    reverse_rc = reverse_complement_records(reverse_groomed)
-
-    with open(os.path.join(work, "reverse_complement.fastq"), "w") as f:
-        f.write(records_to_fastq_string(reverse_rc))
-
-    print(f"  RC first seq: {str(reverse_rc[0].seq[:50])}...")
-
-    # ---------------------------------------------------------------
-    # STEP 7: Sort reversed collection
-    # ---------------------------------------------------------------
-    print("\n[Step 6] Sorting reversed collection alphabetically...")
-
-    reverse_rc_sorted = sort_records_alpha(reverse_rc)
-
-    # ---------------------------------------------------------------
-    # STEP 8: Merge Paired-End
-    # ---------------------------------------------------------------
-    print("\n[Step 7] Merging paired-end reads (interleaved)...")
-
-    merged = mergepe_interleaved(forward_sorted, reverse_rc_sorted)
-
-    with open(os.path.join(work, "merged_interleaved.fastq"), "w") as f:
-        f.write(records_to_fastq_string(merged))
-
-    print(f"  Merged {len(merged)} records ({len(merged)//2} pairs)")
-
-    # ---------------------------------------------------------------
-    # STEP 9: FASTQ Groomer (post-merge)
-    # ---------------------------------------------------------------
-    print("\n[Step 8] FASTQ Groomer (post-merge encoding fix)...")
-
-    merged_groomed = fastq_groomer(merged)
-
-    with open(os.path.join(work, "merged_groomed.fastq"), "w") as f:
-        f.write(records_to_fastq_string(merged_groomed))
-
-    # ---------------------------------------------------------------
-    # STEP 10: FASTQ → Tabular
-    # ---------------------------------------------------------------
-    print("\n[Step 9] FASTQ to Tabular conversion...")
-
-    tabular = fastq_to_tabular(merged_groomed)
-
-    with open(os.path.join(work, "merged.tabular"), "w") as f:
-        f.write(tabular)
-
-    tab_lines = tabular.strip().split("\n")
-    print(f"  {len(tab_lines)} tabular records created")
-
-    # ---------------------------------------------------------------
-    # STEP 11: Tabular → FASTA
-    # ---------------------------------------------------------------
-    print("\n[Step 10] Tabular to FASTA conversion...")
-
-    fasta_records = tabular_to_fasta(tabular)
-
-    with open(os.path.join(work, "merged.fasta"), "w") as f:
-        SeqIO.write(fasta_records, f, "fasta")
-
-    print(f"  {len(fasta_records)} FASTA sequences created")
-
-    # ---------------------------------------------------------------
-    # STEP 12: MAFFT Alignment (first pass)
-    # ---------------------------------------------------------------
-    print("\n[Step 11] MAFFT alignment (first pass)...")
-
-    aligned_records_1, log1 = mafft_align(fasta_records)
-
-    with open(os.path.join(work, "aligned.fasta"), "w") as f:
-        SeqIO.write(aligned_records_1, f, "fasta")
-    with open(os.path.join(work, "alignment_log_1.txt"), "w") as f:
-        f.write(log1)
-
-    print(f"  Aligned {len(aligned_records_1)} sequences")
-    print(f"  Alignment length: {len(aligned_records_1[0].seq)} bp")
-
-    # ---------------------------------------------------------------
-    # STEP 13: Consensus from Aligned FASTA
-    # ---------------------------------------------------------------
-    print("\n[Step 12] Building consensus sequence (quality-weighted chr_ambiguity)...")
-
-    # Pass quality scores from the original records for weighting
-    # The aligned records should have quality annotations from the input
-    aligned_quals = []
-    for rec in aligned_records_1:
-        quals = rec.letter_annotations.get("phred_quality", [])
-        if quals:
-            aligned_quals.append(quals)
-        else:
-            # Use default quality if not available
-            aligned_quals.append([20] * len(rec.seq))
-
-    sample_name = args.sample_name if args.sample_name else os.path.basename(os.path.abspath(work))
-    consensus = aligned_to_consensus(aligned_records_1, aligned_with_quals=aligned_quals, sample_name=sample_name)
-
-    with open(os.path.join(work, "consensus.fasta"), "w") as f:
-        SeqIO.write([consensus], f, "fasta")
-
-    print(f"  Consensus length: {len(consensus.seq)} bp")
-    print(f"  First 80 bp: {str(consensus.seq[:80])}")
-
-    # ---------------------------------------------------------------
-    # STEP 14: Merge.files (merge consensus with aligned sequences)
-    # ---------------------------------------------------------------
-    print("\n[Step 13] Merge.files (combining consensus + aligned sequences)...")
-
-    # Merge consensus with alignment
-    all_sequences = aligned_records_1 + [consensus]
-
-    with open(os.path.join(work, "all_sequences.fasta"), "w") as f:
-        SeqIO.write(all_sequences, f, "fasta")
-
-    print(f"  Total sequences: {len(all_sequences)} ({len(aligned_records_1)} aligned + 1 consensus)")
-
-    # ---------------------------------------------------------------
-    # STEP 15: Regex Find And Replace (format headers)
-    # ---------------------------------------------------------------
-    print("\n[Step 14] Regex Find And Replace (formatting FASTA headers)...")
-
-    # Read the FASTA file
-    fasta_str = ""
-    for rec in all_sequences:
-        fasta_str += f">{rec.id}\n{str(rec.seq)}\n"
-
-    formatted_fasta = regex_find_replace_fasta(fasta_str)
-
-    with open(os.path.join(work, "formatted_sequences.fasta"), "w") as f:
-        f.write(formatted_fasta)
-
-    # ---------------------------------------------------------------
-    # STEP 16: Final MAFFT Alignment
-    # ---------------------------------------------------------------
-    print("\n[Step 15] MAFFT alignment (final pass on formatted sequences)...")
-
-    # Parse the formatted FASTA back
-    import io
-    formatted_records = list(SeqIO.parse(io.StringIO(formatted_fasta), "fasta"))
-
-    aligned_records_final, log2 = mafft_align(formatted_records)
-
-    with open(os.path.join(work, "final_aligned.fasta"), "w") as f:
-        SeqIO.write(aligned_records_final, f, "fasta")
-    with open(os.path.join(work, "alignment_log_2.txt"), "w") as f:
-        f.write(log2)
-
-    print(f"  Final alignment: {len(aligned_records_final)} sequences, {len(aligned_records_final[0].seq)} bp")
-
-    # ---------------------------------------------------------------
-    # QUALITY STATISTICS
-    # ---------------------------------------------------------------
-    print("\n[Step 16] Computing quality statistics...")
-
-    consensus_seq = str(consensus.seq).upper()
-    consensus_len = len(consensus_seq)
-
-    base_counts = Counter(consensus_seq)
-    valid_bases = sum(base_counts[b] for b in "ATCG")
-    ambiguous_bases = sum(base_counts[b] for b in "RYSWKMBDHVN")
-    n_bases = base_counts.get("N", 0)
-    gap_bases = base_counts.get("-", 0) + base_counts.get(".", 0)
-
-    gc_count = base_counts.get("G", 0) + base_counts.get("C", 0)
-    gc_content = (gc_count / valid_bases * 100) if valid_bases > 0 else 0.0
-    ambiguity_pct = (ambiguous_bases / consensus_len * 100) if consensus_len > 0 else 0.0
-    n_pct = (n_bases / consensus_len * 100) if consensus_len > 0 else 0.0
-    gap_pct = (gap_bases / consensus_len * 100) if consensus_len > 0 else 0.0
-    coverage_pct = (valid_bases / consensus_len * 100) if consensus_len > 0 else 0.0
-
-    # Per-read quality stats from raw reads
-    all_fwd_quals = []
-    for rec in forward_records_raw:
-        all_fwd_quals.extend(rec.letter_annotations.get("phred_quality", []))
-    all_rev_quals = []
-    for rec in reverse_records_raw:
-        all_rev_quals.extend(rec.letter_annotations.get("phred_quality", []))
-
-    fwd_avg_qual = sum(all_fwd_quals) / len(all_fwd_quals) if all_fwd_quals else 0
-    rev_avg_qual = sum(all_rev_quals) / len(all_rev_quals) if all_rev_quals else 0
-    fwd_min_qual = min(all_fwd_quals) if all_fwd_quals else 0
-    rev_min_qual = min(all_rev_quals) if all_rev_quals else 0
-
-    # Quality rating
-    if ambiguity_pct < 1 and n_pct < 1:
-        quality_rating = "Excellent"
-    elif ambiguity_pct < 3 and n_pct < 3:
-        quality_rating = "Good"
-    elif ambiguity_pct < 5 and n_pct < 5:
-        quality_rating = "Fair"
-    else:
-        quality_rating = "Poor"
-
-    stats = {
-        "sample_name": sample_name,
-        "forward_file": os.path.basename(forward_ab1_files[0]) if forward_ab1_files else "",
-        "reverse_file": os.path.basename(reverse_ab1_files[0]) if reverse_ab1_files else "",
-        "forward_raw_length": len(forward_records_raw[0].seq) if forward_records_raw else 0,
-        "reverse_raw_length": len(reverse_records_raw[0].seq) if reverse_records_raw else 0,
-        "forward_trimmed_length": len(forward_trimmed[0].seq) if forward_trimmed else 0,
-        "reverse_trimmed_length": len(reverse_trimmed[0].seq) if reverse_trimmed else 0,
-        "alignment_length": len(aligned_records_1[0].seq) if aligned_records_1 else 0,
-        "consensus_length": consensus_len,
-        "valid_bases": valid_bases,
-        "ambiguous_bases": ambiguous_bases,
-        "n_bases": n_bases,
-        "gap_bases": gap_bases,
-        "gc_content": round(gc_content, 2),
-        "ambiguity_pct": round(ambiguity_pct, 2),
-        "n_pct": round(n_pct, 2),
-        "gap_pct": round(gap_pct, 2),
-        "coverage_pct": round(coverage_pct, 2),
-        "forward_avg_quality": round(fwd_avg_qual, 1),
-        "reverse_avg_quality": round(rev_avg_qual, 1),
-        "forward_min_quality": fwd_min_qual,
-        "reverse_min_quality": rev_min_qual,
-        "quality_rating": quality_rating,
-        "num_sequences_aligned": len(aligned_records_1),
-    }
-
-    stats_path = os.path.join(work, "sample_stats.json")
-    with open(stats_path, "w") as f:
-        json.dump(stats, f, indent=2)
-
-    print(f"  Quality rating: {quality_rating}")
-    print(f"  Consensus: {consensus_len} bp, GC: {gc_content:.1f}%, Ambiguity: {ambiguity_pct:.1f}%")
-    print(f"  → sample_stats.json")
-
-    # ---------------------------------------------------------------
-    # SUMMARY
-    # ---------------------------------------------------------------
-    print("\n" + "=" * 70)
-    print("WORKFLOW COMPLETE!")
-    print("=" * 70)
-    print(f"\nOutput directory: {os.path.abspath(work)}/")
-    print("\nFiles produced:")
-    for fname in sorted(os.listdir(work)):
-        fpath = os.path.join(work, fname)
-        size = os.path.getsize(fpath)
-        print(f"  {fname:40s} ({size:,} bytes)")
-
-    print("\n" + "=" * 70)
-    print("WORKFLOW STEP SUMMARY:")
-    print("=" * 70)
-    print(f"  {'Step':12s} | {'Tool':30s} | {'Output'}")
-    print(f"  {'-'*12}-+-{'-'*30}-+-{'-'*30}")
-    steps = [
-        ("Steps 1-2", "AB1 to FASTQ", "forward_raw.fastq, reverse_raw.fastq"),
-        ("Step 3", "Quality trimming", "forward_trimmed.fastq, reverse_trimmed.fastq"),
-        ("Step 4", "Sort collection", "sorted in memory"),
-        ("Step 5", "FASTQ Groomer", "reverse_groomed.fastq"),
-        ("Step 6", "Reverse-Complement", "reverse_complement.fastq"),
-        ("Step 7", "Sort collection", "sorted in memory"),
-        ("Step 8", "Merge paired-end", "merged_interleaved.fastq"),
-        ("Step 9", "FASTQ Groomer", "merged_groomed.fastq"),
-        ("Step 10", "FASTQ to Tabular", "merged.tabular"),
-        ("Step 11", "Tabular-to-FASTA", "merged.fasta"),
-        ("Step 12", "MAFFT alignment", "aligned.fasta"),
-        ("Step 13", "Consensus", "consensus.fasta"),
-        ("Steps 14-15", "Merge files", "all_sequences.fasta"),
-        ("Step 16", "Regex format", "formatted_sequences.fasta"),
-        ("Step 17", "MAFFT alignment", "final_aligned.fasta"),
-    ]
-    for step, tool, output in steps:
-        print(f"  {step:12s} | {tool:30s} | {output}")
-
-    print("\nDone!")
+    returncode, _ = run_workflow(
+        args.forward, args.reverse, args.output,
+        trim_quality=args.trim_quality,
+        sample_name=args.sample_name,
+    )
+    sys.exit(returncode)
 
 
 if __name__ == "__main__":

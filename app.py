@@ -80,7 +80,11 @@ def run_workflow(forward_dir, reverse_dir, output_dir, trim_quality=0.05, sample
 
 def run_wrapper_batch(upload_dir, output_dir, trim_quality=0.05, status_container=None, progress_bar=None):
     """Run sanger_wrapper.py batch mode directly (no subprocess)."""
-    result = run_batch_workflow(upload_dir, output_dir, trim_quality=trim_quality)
+    try:
+        result = run_batch_workflow(upload_dir, output_dir, trim_quality=trim_quality)
+    except Exception as e:
+        import traceback
+        return 1, f"Batch wrapper error: {e}\n" + traceback.format_exc()
     if isinstance(result, tuple) and len(result) == 2:
         returncode, output = result
     elif isinstance(result, int):

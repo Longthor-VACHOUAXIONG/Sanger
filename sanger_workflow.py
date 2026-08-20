@@ -272,7 +272,7 @@ def trimfq_quality(records: list, q: float = 0.05) -> list:
 # STEP 3 – Sort Collection (alphabetical)
 # ===========================================================================
 def sort_records_alpha(records: list) -> list:
-    """Sort SeqRecords alphabetically by ID – equivalent to Galaxy Sort collection."""
+    """Sort SeqRecords alphabetically by ID."""
     return sorted(records, key=lambda r: r.id)
 
 

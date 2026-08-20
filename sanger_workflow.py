@@ -335,7 +335,7 @@ def fastq_to_tabular(records: list) -> str:
     """
     Convert FASTQ to tabular format.
     Columns: sequence identifier, sequence
-    Equivalent to Galaxy's fastq_to_tabular.
+    Equivalent to fastq_to_tabular.
     """
     lines = []
     for rec in records:
@@ -351,7 +351,7 @@ def tabular_to_fasta(tabular_str: str) -> list:
     """
     Convert tabular to FASTA.
     seq_col=2 (sequence), title_col=1 (identifier)
-    Equivalent to Galaxy's tabular_to_fasta.
+    Equivalent to tabular_to_fasta.
     """
     records = []
     for line in tabular_str.strip().split("\n"):

@@ -218,7 +218,11 @@ def cleanup_temp_dirs(*dirs):
 
 def run_workflow(forward_dir, reverse_dir, output_dir, trim_quality=0.05, sample_name=None):
     """Run the sanger_workflow.py script directly (no subprocess)."""
-    rc, output = workflow_run(forward_dir, reverse_dir, output_dir, trim_quality=trim_quality, sample_name=sample_name)
+    result = workflow_run(forward_dir, reverse_dir, output_dir, trim_quality=trim_quality, sample_name=sample_name)
+    if isinstance(result, tuple):
+        rc, output = result
+    else:
+        rc, output = result, ""
     if output:
         print(output)
     return rc, output

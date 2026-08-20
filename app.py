@@ -79,6 +79,7 @@ def stream_process(cmd, status_container, progress_bar=None, total_steps=16, tim
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
         bufsize=1,
     )
     log_lines = []
@@ -204,6 +205,21 @@ def cleanup_session(session_id):
             shutil.rmtree(d, ignore_errors=True)
 
 
+def init_session_state():
+    """Initialize session state variables."""
+    defaults = {
+        "run_returncode": None,
+        "run_output": "",
+        "run_elapsed": 0,
+        "run_output_dir": "",
+        "run_session_id": "",
+        "run_mode": "Single pair",
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
 # ---------------------------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------------------------
@@ -299,6 +315,10 @@ if st.button("🚀 Run Workflow", type="primary", disabled=run_disabled):
     with st.spinner("Setting up..."):
         cleanup_session(session_id)
 
+    returncode = None
+    output = ""
+    elapsed = 0
+
     if mode == "Single pair":
         # Save uploaded files
         fwd_dir, fwd_paths = save_uploaded_files(forward_files, f"{session_id}/forward")
@@ -337,7 +357,24 @@ if st.button("🚀 Run Workflow", type="primary", disabled=run_disabled):
             else:
                 status.update(label=f"❌ Batch failed after {elapsed}s", state="error")
 
-    # ---- Show results ----
+    # Persist results in session state so they survive reruns
+    st.session_state.run_returncode = returncode
+    st.session_state.run_output = output
+    st.session_state.run_elapsed = elapsed
+    st.session_state.run_output_dir = output_dir
+    st.session_state.run_session_id = session_id
+    st.session_state.run_mode = mode
+
+init_session_state()
+returncode = st.session_state.run_returncode
+output = st.session_state.run_output
+elapsed = st.session_state.run_elapsed
+output_dir = st.session_state.run_output_dir
+session_id = st.session_state.run_session_id
+mode = st.session_state.run_mode
+
+# ---- Show results ----
+if returncode is not None:
     if returncode == 0:
         st.success(f"✅ Workflow completed in {elapsed}s!")
     else:
@@ -486,11 +523,11 @@ if st.button("🚀 Run Workflow", type="primary", disabled=run_disabled):
                     with st.expander(f"{sample_name} — {len(seq)} bp — {s['quality_rating']}"):
                         st.code(f">{header}\n{seq}", language="text")
 
-    # Cleanup button
-    st.markdown("---")
-    if st.button("🗑️ Clean up temp files"):
-        cleanup_session(session_id)
-        st.success("Cleaned up!")
+# Cleanup button
+st.markdown("---")
+if returncode is not None and st.button("🗑️ Clean up temp files"):
+    cleanup_session(session_id)
+    st.success("Cleaned up!")
 
 # ---- Footer ----
 st.markdown("---")

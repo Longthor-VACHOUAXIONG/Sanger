@@ -652,7 +652,6 @@ def main():
 
     # ---------------------------------------------------------------
     # STEP 11: Tabular → FASTA
-    # Galaxy step 13
     # ---------------------------------------------------------------
     print("\n[Step 10] Tabular to FASTA conversion...")
 
@@ -665,7 +664,6 @@ def main():
 
     # ---------------------------------------------------------------
     # STEP 12: MAFFT Alignment (first pass)
-    # Galaxy step 14
     # ---------------------------------------------------------------
     print("\n[Step 11] MAFFT alignment (first pass)...")
 
@@ -681,7 +679,6 @@ def main():
 
     # ---------------------------------------------------------------
     # STEP 13: Consensus from Aligned FASTA
-    # Galaxy step 15
     # ---------------------------------------------------------------
     print("\n[Step 12] Building consensus sequence (quality-weighted chr_ambiguity)...")
 
@@ -707,11 +704,10 @@ def main():
 
     # ---------------------------------------------------------------
     # STEP 14: Merge.files (merge consensus with aligned sequences)
-    # Galaxy steps 16 & 17
     # ---------------------------------------------------------------
     print("\n[Step 13] Merge.files (combining consensus + aligned sequences)...")
 
-    # Galaxy merges the consensus with the alignment
+    # Merge consensus with alignment
     all_sequences = aligned_records_1 + [consensus]
 
     with open(os.path.join(work, "all_sequences.fasta"), "w") as f:
@@ -721,7 +717,6 @@ def main():
 
     # ---------------------------------------------------------------
     # STEP 15: Regex Find And Replace (format headers)
-    # Galaxy step 18
     # ---------------------------------------------------------------
     print("\n[Step 14] Regex Find And Replace (formatting FASTA headers)...")
 
@@ -737,7 +732,6 @@ def main():
 
     # ---------------------------------------------------------------
     # STEP 16: Final MAFFT Alignment
-    # Galaxy step 19
     # ---------------------------------------------------------------
     print("\n[Step 15] MAFFT alignment (final pass on formatted sequences)...")
 
@@ -847,28 +841,29 @@ def main():
         print(f"  {fname:40s} ({size:,} bytes)")
 
     print("\n" + "=" * 70)
-    print("SANGER SEQUENCING WORKFLOW STEP MAPPING:")
+    print("WORKFLOW STEP SUMMARY:")
     print("=" * 70)
-    mapping = [
-        ("Steps 0-1", "Input collections", "F/*.ab1, R/*.ab1"),
-        ("Steps 2-3", "ab1 to FASTQ converter", "forward_raw.fastq, reverse_raw.fastq"),
-        ("Steps 4-5", "seqtk trimfq (q=0.05)", "forward_trimmed.fastq, reverse_trimmed.fastq"),
-        ("Step 6",    "Sort collection", "sorted in memory"),
-        ("Step 7",    "FASTQ Groomer", "reverse_groomed.fastq"),
-        ("Step 8",    "Reverse-Complement", "reverse_complement.fastq"),
-        ("Step 9",    "Sort collection", "sorted in memory"),
-        ("Step 10",   "seqtk mergepe", "merged_interleaved.fastq"),
-        ("Step 11",   "FASTQ Groomer", "merged_groomed.fastq"),
-        ("Step 12",   "FASTQ to Tabular", "merged.tabular"),
-        ("Step 13",   "Tabular-to-FASTA", "merged.fasta"),
-        ("Step 14",   "Align sequences (MAFFT)", "aligned.fasta"),
-        ("Step 15",   "Consensus from aligned FASTA", "consensus.fasta"),
-        ("Steps 16-17", "Merge.files", "all_sequences.fasta"),
-        ("Step 18",   "Regex Find And Replace", "formatted_sequences.fasta"),
-        ("Step 19",   "Align sequences (MAFFT)", "final_aligned.fasta"),
+    print(f"  {'Step':12s} | {'Tool':30s} | {'Output'}")
+    print(f"  {'-'*12}-+-{'-'*30}-+-{'-'*30}")
+    steps = [
+        ("Steps 1-2", "AB1 to FASTQ", "forward_raw.fastq, reverse_raw.fastq"),
+        ("Step 3", "Quality trimming", "forward_trimmed.fastq, reverse_trimmed.fastq"),
+        ("Step 4", "Sort collection", "sorted in memory"),
+        ("Step 5", "FASTQ Groomer", "reverse_groomed.fastq"),
+        ("Step 6", "Reverse-Complement", "reverse_complement.fastq"),
+        ("Step 7", "Sort collection", "sorted in memory"),
+        ("Step 8", "Merge paired-end", "merged_interleaved.fastq"),
+        ("Step 9", "FASTQ Groomer", "merged_groomed.fastq"),
+        ("Step 10", "FASTQ to Tabular", "merged.tabular"),
+        ("Step 11", "Tabular-to-FASTA", "merged.fasta"),
+        ("Step 12", "MAFFT alignment", "aligned.fasta"),
+        ("Step 13", "Consensus", "consensus.fasta"),
+        ("Steps 14-15", "Merge files", "all_sequences.fasta"),
+        ("Step 16", "Regex format", "formatted_sequences.fasta"),
+        ("Step 17", "MAFFT alignment", "final_aligned.fasta"),
     ]
-    for galaxy_step, tool_name, output_file in mapping:
-        print(f"{galaxy_step:12s} | {tool_name:30s} | {output_file}")
+    for step, tool, output in steps:
+        print(f"  {step:12s} | {tool:30s} | {output}")
 
     print("\nDone!")
 

@@ -560,7 +560,7 @@ Examples:
     print("SANGER WORKFLOW WRAPPER")
     print("=" * 70)
 
-    # ---- BATCH MODE: Process all files together (matches Galaxy) ----
+    # ---- BATCH MODE: Process all files together ----
     if args.batch:
         print(f"\nMode: BATCH (process all files together)")
 

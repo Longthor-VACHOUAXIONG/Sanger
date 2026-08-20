@@ -207,6 +207,13 @@ def cleanup_session(session_id):
             shutil.rmtree(d, ignore_errors=True)
 
 
+def cleanup_uploaded_files(session_id):
+    """Clean up only the uploaded files, keeping workflow results."""
+    upload_dir = os.path.join(TEMP_UPLOAD_DIR, session_id)
+    if os.path.exists(upload_dir):
+        shutil.rmtree(upload_dir, ignore_errors=True)
+
+
 def init_session_state():
     """Initialize session state variables."""
     defaults = {
@@ -253,6 +260,13 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### Links")
     st.markdown("[📖 Usage Guide](./USAGE.md)")
+    st.markdown("---")
+    st.markdown(
+        "<small>🔒 Uploaded files are processed on the server and stored temporarily. "
+        "Please do not upload sensitive or confidential data. "
+        "Use 'Clean up temp files' after downloading results.</small>",
+        unsafe_allow_html=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +364,8 @@ if st.button("🚀 Run Workflow", type="primary", disabled=run_disabled):
             else:
                 status.update(label=f"❌ Workflow failed after {elapsed}s", state="error")
 
+        cleanup_uploaded_files(session_id)
+
     else:
         # Save all files to one directory
         upload_dir, saved_paths = save_uploaded_files(all_files, session_id)
@@ -367,6 +383,8 @@ if st.button("🚀 Run Workflow", type="primary", disabled=run_disabled):
                 status.update(label=f"✅ Batch completed in {elapsed}s", state="complete")
             else:
                 status.update(label=f"❌ Batch failed after {elapsed}s", state="error")
+
+        cleanup_uploaded_files(session_id)
 
     # Persist results in session state so they survive reruns
     st.session_state.run_returncode = returncode

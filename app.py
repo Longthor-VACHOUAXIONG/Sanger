@@ -366,12 +366,9 @@ if st.button("🚀 Run Workflow", type="primary", disabled=run_disabled):
     st.session_state.run_mode = mode
 
 init_session_state()
-returncode = st.session_state.run_returncode
-output = st.session_state.run_output
-elapsed = st.session_state.run_elapsed
+run_mode = st.session_state.run_mode
 output_dir = st.session_state.run_output_dir
 session_id = st.session_state.run_session_id
-mode = st.session_state.run_mode
 
 # ---- Show results ----
 if returncode is not None:
@@ -388,7 +385,7 @@ if returncode is not None:
     st.markdown("---")
     st.markdown("## 📊 Results")
 
-    if mode == "Single pair":
+    if run_mode == "Single pair":
         # Single sample results
         stats = load_sample_stats(output_dir)
         if stats:

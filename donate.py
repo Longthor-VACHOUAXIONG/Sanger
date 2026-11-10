@@ -20,7 +20,7 @@ from i18n import t
 # ---------------------------------------------------------------------------
 # CONFIG - replace the placeholders
 # ---------------------------------------------------------------------------
-DONATE_DIR = Path(__file__).parent / "donate"
+DONATE_DIR = Path(__file__).parent
 
 BANK = {
     "image": DONATE_DIR / "bank_qr.png",

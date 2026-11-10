@@ -24,21 +24,21 @@ DONATE_DIR = Path(__file__).parent  # base project folder
 
 BANK = {
     "image": DONATE_DIR / "bank_qr.png",
-    "bank_name": "YOUR BANK NAME",          # e.g. BCEL
-    "account_name": "YOUR ACCOUNT NAME",
-    "account_number": "0000000000000",
+    "bank_name": "BCEL",          # e.g. BCEL
+    "account_name": "LONGTHOR VACHOUAXIONG MR",
+    "account_number": "0101210014123",
 }
 
 USDT = {
     "image": DONATE_DIR / "usdt_qr.png",
     "network": "TRC20 (Tron)",              # MUST match the address type
-    "address": "YOUR_USDT_ADDRESS",
+    "address": "TM2GbpiTN9ouNdnVnYgYViSLQtnRmPcbHh",
 }
 
 BTC = {
     "image": DONATE_DIR / "btc_qr.png",
     "network": "Bitcoin",
-    "address": "YOUR_BITCOIN_ADDRESS",
+    "address": "1FcmyGvHmd5XKJb2mifbeS5jVWrWJbLeNX",
 }
 
 QR_WIDTH = 240

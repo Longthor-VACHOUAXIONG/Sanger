@@ -170,7 +170,7 @@ def init_session_state():
 # ---------------------------------------------------------------------------
 
 with st.sidebar:
-    st.title("🧬 Sanger Sequencing")
+    st.title("🧬 Sanger Sequencing ກ")
     st.markdown("---")
     st.markdown("**Pipeline:** Sanger Sequencing Data Analysis")
     st.markdown("**Steps:**")

@@ -1,11 +1,11 @@
 """
 Donate section for the Sanger Streamlit app.
 
-EDIT THE CONFIG BELOW with your own details, then put your QR images in a
-`donate/` folder next to this file:
-    donate/bank_qr.png
-    donate/usdt_qr.png
-    donate/btc_qr.png
+EDIT THE CONFIG BELOW with your own details, then put your QR images in the
+same folder as this file (base project folder):
+    bank_qr.png   (your bank QR, e.g. OnePay / BCEL One / other)
+    usdt_qr.png   (optional - auto-generated from the address if missing)
+    btc_qr.png    (optional - auto-generated from the address if missing)
 
 Auto-generation needs:  pip install "qrcode[pil]"
 """
@@ -20,25 +20,25 @@ from i18n import t
 # ---------------------------------------------------------------------------
 # CONFIG - replace the placeholders
 # ---------------------------------------------------------------------------
-DONATE_DIR = Path(__file__).parent
+DONATE_DIR = Path(__file__).parent  # base project folder
 
 BANK = {
     "image": DONATE_DIR / "bank_qr.png",
-    "bank_name": "BCEL",          # e.g. BCEL
-    "account_name": "LONGTHOR VACHOUAXIONG MR",
-    "account_number": "0101210014123",  # e.g. 0101210014123
+    "bank_name": "YOUR BANK NAME",          # e.g. BCEL
+    "account_name": "YOUR ACCOUNT NAME",
+    "account_number": "0000000000000",
 }
 
 USDT = {
     "image": DONATE_DIR / "usdt_qr.png",
     "network": "TRC20 (Tron)",              # MUST match the address type
-    "address": "TM2GbpiTN9ouNdnVnYgYViSLQtnRmPcbHh",
+    "address": "YOUR_USDT_ADDRESS",
 }
 
 BTC = {
     "image": DONATE_DIR / "btc_qr.png",
     "network": "Bitcoin",
-    "address": "1FcmyGvHmd5XKJb2mifbeS5jVWrWJbLeNX",
+    "address": "YOUR_BITCOIN_ADDRESS",
 }
 
 QR_WIDTH = 240

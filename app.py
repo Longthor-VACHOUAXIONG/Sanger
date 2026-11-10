@@ -198,9 +198,7 @@ with st.sidebar:
     st.markdown("[📖 Usage Guide](./USAGE.md)")
     st.markdown("---")
     st.markdown(
-        "<small>🔒 Uploaded files are processed on the server and stored temporarily. "
-        "Please do not upload sensitive or confidential data. "
-        "Use 'Clean up temp files' after downloading results.</small>",
+        "<small>🔒 Use 'Clean up temp files' after downloading results.</small>",
         unsafe_allow_html=True,
     )
 
@@ -209,7 +207,7 @@ with st.sidebar:
 # Main content
 # ---------------------------------------------------------------------------
 
-st.title("🧬 Sanger Sequencing Data Analysis")
+st.title("🧬 Sanger Sequencing")
 st.markdown("Upload your AB1 files and run the Sanger pipeline.")
 
 # ---- Mode selection ----

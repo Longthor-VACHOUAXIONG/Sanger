@@ -86,9 +86,21 @@ def _crypto_tab(cfg: dict, coin_label: str):
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
-def render_donate():
-    st.markdown("---")
-    with st.expander(t("donate_title"), expanded=False):
+def render_donate(expanded: bool = True):
+    st.markdown(
+        """
+<style>
+    div[data-testid="stExpander"]:has(.donate-marker) {
+        border: 2px solid #e74c3c !important;
+        border-radius: 10px;
+        background: rgba(231, 76, 60, 0.05);
+    }
+</style>
+""",
+        unsafe_allow_html=True,
+    )
+    with st.expander(t("donate_title"), expanded=expanded):
+        st.markdown('<span class="donate-marker"></span>', unsafe_allow_html=True)
         st.markdown(t("donate_intro"))
         tab_bank, tab_usdt, tab_btc = st.tabs(
             [t("donate_bank"), "USDT", "Bitcoin"]

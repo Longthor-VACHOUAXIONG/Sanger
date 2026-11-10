@@ -206,6 +206,8 @@ with st.sidebar:
 st.title(t("title"))
 st.markdown(t("intro"))
 
+render_donate(expanded=True)  # donate box at the top, open by default
+
 mode = st.radio(
     t("mode_label"),
     [MODE_SINGLE, MODE_MULTI],
@@ -466,8 +468,6 @@ st.markdown("---")
 if returncode is not None and st.button(t("cleanup")):
     cleanup_session(session_id)
     st.success(t("cleaned"))
-
-render_donate()
 
 st.markdown("---")
 st.markdown(t("footer"), help=t("footer_help"))

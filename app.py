@@ -19,6 +19,7 @@ import streamlit as st
 from sanger_workflow import run_workflow as workflow_run
 from sanger_wrapper import run_batch_workflow
 from i18n import LANGUAGES, set_lang, t, inject_font
+from donate import render_donate
 
 # Global exception handler to show full traceback in Streamlit
 def _excepthook(exc_type, exc_value, exc_tb):
@@ -465,6 +466,8 @@ st.markdown("---")
 if returncode is not None and st.button(t("cleanup")):
     cleanup_session(session_id)
     st.success(t("cleaned"))
+
+render_donate()
 
 st.markdown("---")
 st.markdown(t("footer"), help=t("footer_help"))

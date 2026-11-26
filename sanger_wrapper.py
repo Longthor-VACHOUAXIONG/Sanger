@@ -81,7 +81,7 @@ def pair_files(paths):
     return jobs, unmatched
 
 
-def run_batch(jobs, output_dir, trim_quality=0.05, reference=None, progress=None):
+def run_batch(jobs, output_dir, trim_quality=0.05, reference=None, progress=None, min_base_q=10):
     """
     Run every job. Returns (stats_list, errors) with errors = [(sample, message)].
     One failing sample never stops the others. Writes summary files.
@@ -93,7 +93,7 @@ def run_batch(jobs, output_dir, trim_quality=0.05, reference=None, progress=None
             progress(i - 1, len(jobs), sample)
         try:
             stats_list.append(wf.run_sample(sample, fwd, rev, os.path.join(output_dir, sample),
-                                            trim_quality, reference))
+                                            trim_quality, reference, min_base_q))
         except Exception as e:  # noqa: BLE001 - report and continue
             errors.append((sample, str(e)))
     if progress:

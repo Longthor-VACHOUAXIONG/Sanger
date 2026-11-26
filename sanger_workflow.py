@@ -443,7 +443,7 @@ def run_sample(sample, forward, reverse, out_dir, trim_quality=0.05,
         "mismatches": mism, "indels": indels, "disagreements": disagreements,
         "num_sequences_aligned": len(usable),
         "quality_rating": rate(amb_pct, n_pct, q20_pct),
-        "warnings": warnings, "reference": None,
+        "warnings": warnings, "reference": None, "min_base_q": min_base_q,
     }
 
     # ---- files ----

@@ -6,6 +6,9 @@ i18n.TRANSLATIONS, so i18n.py does not need to be edited.
 from i18n import TRANSLATIONS
 
 EN = {
+    "minq_label": "Mask bases below Q (→ N)",
+    "minq_help": "Consensus bases with Phred quality below this value are written as N. Lower = fewer Ns but less reliable bases.",
+    "chrom_masked": "This base is N because the read call(s) {calls} are below the quality cut-off Q{q}. Lower “Mask bases below Q” in the sidebar to keep them.",
     "steps": (
         "1. Read AB1 + Phred quality\n"
         "2. Quality trimming (Mott)\n"
@@ -102,6 +105,9 @@ EN = {
 }
 
 LO = {
+    "minq_label": "ປິດບັງເບສທີ່ຕ່ຳກວ່າ Q (→ N)",
+    "minq_help": "ເບສໃນ consensus ທີ່ມີຄຸນນະພາບ Phred ຕ່ຳກວ່າຄ່ານີ້ຈະຖືກຂຽນເປັນ N. ຄ່າຕ່ຳ = N ໜ້ອຍລົງ ແຕ່ເບສເຊື່ອຖືໄດ້ໜ້ອຍລົງ.",
+    "chrom_masked": "ເບສນີ້ເປັນ N ເພາະ read ເອີ້ນເປັນ {calls} ຕ່ຳກວ່າເກນຄຸນນະພາບ Q{q}. ຫຼຸດຄ່າ “ປິດບັງເບສທີ່ຕ່ຳກວ່າ Q” ໃນແຖບດ້ານຂ້າງເພື່ອເກັບໄວ້.",
     "steps": (
         "1. ອ່ານ AB1 + ຄຸນນະພາບ Phred\n"
         "2. ຕັດສ່ວນຄຸນນະພາບຕ່ຳ (Mott)\n"

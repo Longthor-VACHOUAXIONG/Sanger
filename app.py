@@ -68,7 +68,7 @@ def file_bytes(path):
         return f.read()
 
 
-def run_jobs(jobs, unmatched, trim_quality, reference):
+def run_jobs(jobs, unmatched, trim_quality, reference, min_base_q=10):
     """Run all jobs, store results in session_state."""
     old = st.session_state.get("out_dir")
     if old:
@@ -82,7 +82,7 @@ def run_jobs(jobs, unmatched, trim_quality, reference):
 
     t0 = time.perf_counter()
     try:
-        stats, errors = wr.run_batch(jobs, out_dir, trim_quality, reference, cb)
+        stats, errors = wr.run_batch(jobs, out_dir, trim_quality, reference, cb, min_base_q)
     except Exception as e:  # noqa: BLE001
         stats, errors = [], [("run", f"{e}\n{traceback.format_exc()}")]
     prog.empty()
@@ -103,6 +103,7 @@ with st.sidebar:
     st.markdown("---")
     st.markdown(f"### {t('settings')}")
     trim_quality = st.slider(t("trim_label"), 0.01, 0.20, 0.05, 0.01, help=t("trim_help"))
+    min_base_q = st.slider(t("minq_label"), 0, 30, 10, 1, help=t("minq_help"))
 
     st.markdown("---")
     st.markdown(f"### {t('ref_title')}")
@@ -144,7 +145,7 @@ if example_jobs and st.session_state.stats is None:
     with c2:
         st.caption(t("example_hint"))
     if try_example:
-        run_jobs(example_jobs, [], trim_quality, reference)
+        run_jobs(example_jobs, [], trim_quality, reference, min_base_q)
         st.rerun()
 
 mode = st.radio(t("mode_label"), [MODE_SINGLE, MODE_MULTI], horizontal=True,
@@ -183,7 +184,7 @@ if st.button(t("run"), type="primary", disabled=disabled):
         else:
             jobs, unmatched = wr.pair_files([save(u) for u in all_up])
         if jobs:
-            run_jobs(jobs, [os.path.basename(u) for u in unmatched], trim_quality, reference)
+            run_jobs(jobs, [os.path.basename(u) for u in unmatched], trim_quality, reference, min_base_q)
         else:
             st.session_state.update(stats=[], errors=[("-", t("no_files_ok"))], unmatched=[],
                                     out_dir="", elapsed=0.0)
@@ -281,7 +282,8 @@ def tab_chromatogram(s, out_dir):
                 c1 = fm + 1
                 panels.append({"label": f"{t('chrom_fwd')} — {t('chrom_base')} {c1}: "
                                         f"{tr['bases'][c1 - 1]} (Q{tr['quals'][c1 - 1]})",
-                               "trace": tr, "center": c1, "trim": tuple(s["forward_trim"])})
+                               "trace": tr, "center": c1, "trim": tuple(s["forward_trim"]),
+                               "called": (tr["bases"][c1 - 1], tr["quals"][c1 - 1])})
             else:
                 st.info(t("chrom_nocover", read=t("chrom_fwd")))
         if s["reverse_file"]:
@@ -292,12 +294,16 @@ def tab_chromatogram(s, out_dir):
                 e0, e1 = s["reverse_trim"]
                 panels.append({"label": f"{t('chrom_rev')} — {t('chrom_base')} {c1}: "
                                         f"{tr['bases'][c1 - 1]} (Q{tr['quals'][c1 - 1]})",
-                               "trace": tr, "center": c1, "trim": (n - e1, n - e0)})
+                               "trace": tr, "center": c1, "trim": (n - e1, n - e0),
+                               "called": (tr["bases"][c1 - 1], tr["quals"][c1 - 1])})
             else:
                 st.info(t("chrom_nocover", read=t("chrom_rev")))
     except Exception as e:  # noqa: BLE001
         st.error(t("chrom_error", err=e))
         return
+    if seq[cpos - 1] == "N" and any(p["called"][0] != "N" for p in panels):
+        calls = ", ".join(f"{p['called'][0]} (Q{p['called'][1]})" for p in panels)
+        st.info(t("chrom_masked", calls=calls, q=s.get("min_base_q", 10)))
     if panels:
         st.plotly_chart(chrom.make_stacked_figure(panels, window), key=f"fig_{name}_{cpos}_{window}")
         st.caption(t("chrom_hint"))

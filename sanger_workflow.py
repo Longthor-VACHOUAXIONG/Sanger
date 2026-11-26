@@ -149,6 +149,7 @@ def merge_reads(fseq, fq, fidx, rseq, rq, ridx, min_q=10, margin=10):
         return {"ok": False, "overlap_len": overlap_len, "identity": identity}
 
     cb, cq, src = [], [], []
+    fmap, rmap = [], []                    # original AB1 index per consensus base (-1 = none)
     frow, rrow, crow = [], [], []
     disagreements, mism, indels = [], 0, 0
 
@@ -206,10 +207,12 @@ def merge_reads(fseq, fq, fidx, rseq, rq, ridx, min_q=10, margin=10):
         cq.append(q)
         src.append(s)
         crow.append(base)
+        fmap.append(fidx[a] if a is not None else -1)
+        rmap.append(ridx[b] if b is not None else -1)
 
     return {
         "ok": True, "seq": "".join(cb), "quals": cq, "src": src,
-        "rows": ("".join(frow), "".join(rrow), "".join(crow)),
+        "rows": ("".join(frow), "".join(rrow), "".join(crow)), "fmap": fmap, "rmap": rmap,
         "overlap_len": overlap_len, "identity": identity,
         "disagreements": disagreements, "mismatches": mism, "indels": indels,
         "alignment_length": len(cols),
@@ -381,6 +384,7 @@ def run_sample(sample, forward, reverse, out_dir, trim_quality=0.05,
         if merged["ok"]:
             mode = "paired"
             cons, cq, src = merged["seq"], merged["quals"], merged["src"]
+            fmap, rmap = merged["fmap"], merged["rmap"]
             disagreements, mism, indels = merged["disagreements"], merged["mismatches"], merged["indels"]
             aln_len = merged["alignment_length"]
             with open(os.path.join(out_dir, "alignment.fasta"), "w") as fh:
@@ -399,6 +403,8 @@ def run_sample(sample, forward, reverse, out_dir, trim_quality=0.05,
         cq = list(only["quals"])
         cons = "".join(b if q >= min_base_q else "N" for b, q in zip(cons, cq))
         src = ["F" if usable[0] == "forward" else "R"] * len(cons)
+        fmap = list(only["idx"]) if usable[0] == "forward" else [-1] * len(cons)
+        rmap = list(only["idx"]) if usable[0] == "reverse" else [-1] * len(cons)
         mode = mode or f"{usable[0]}_only"
         aln_len = len(cons)
 
@@ -465,6 +471,7 @@ def run_sample(sample, forward, reverse, out_dir, trim_quality=0.05,
 
     stats["consensus_quals"] = cq
     stats["consensus_src"] = "".join(src)
+    stats["consensus_fmap"], stats["consensus_rmap"] = fmap, rmap
     stats["consensus_seq"] = cons
     stats["elapsed_s"] = round(time.perf_counter() - t0, 2)
     with open(os.path.join(out_dir, "sample_stats.json"), "w") as fh:

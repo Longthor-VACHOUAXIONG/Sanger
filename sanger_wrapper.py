@@ -124,7 +124,7 @@ def write_summary(output_dir, stats_list):
         w.writerow(_CSV_COLS + ["variants_vs_reference"])
         for s in stats_list:
             w.writerow([s[c] for c in _CSV_COLS] + [n_variants(s) if n_variants(s) is not None else ""])
-    slim = [{k: v for k, v in s.items() if k not in ("consensus_quals", "consensus_src")} for s in stats_list]
+    slim = [{k: v for k, v in s.items() if k not in ("consensus_quals", "consensus_src", "consensus_fmap", "consensus_rmap")} for s in stats_list]
     with open(os.path.join(output_dir, "all_sample_stats.json"), "w") as f:
         json.dump(slim, f, indent=1)
     write_html_report(output_dir, stats_list)

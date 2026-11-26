@@ -203,48 +203,104 @@ def tab_consensus(s, out_dir):
                        file_name=f"{s['sample_name']}_consensus.fasta", key=f"dlc_{s['sample_name']}")
 
 
+@st.cache_data(show_spinner=False)
+def get_trace_rc(path):
+    return chrom.reverse_complement_trace(chrom.load_trace(path))
+
+
+def _set_pos(name, pos, L):
+    st.session_state[f"cpos_{name}"] = max(1, min(L, pos))
+
+
+def _jump(name):
+    i = st.session_state.get(f"cg_{name}")
+    if i is not None:
+        st.session_state[f"cpos_{name}"] = st.session_state[f"dis_{name}"][i]
+
+
+def _next_dis(name, direction):
+    cur, dis = st.session_state[f"cpos_{name}"], sorted(st.session_state[f"dis_{name}"])
+    cand = [p for p in dis if p > cur] if direction > 0 else [p for p in dis if p < cur][::-1]
+    if cand:
+        st.session_state[f"cpos_{name}"] = cand[0]
+
+
 def tab_chromatogram(s, out_dir):
-    name = s["sample_name"]
-    ab1 = os.path.join(out_dir, name, "ab1")
-    reads = {}
-    if s["forward_file"]:
-        reads["forward"] = (os.path.join(ab1, s["forward_file"]), s["forward_trim"], "forward_pos")
-    if s["reverse_file"]:
-        reads["reverse"] = (os.path.join(ab1, s["reverse_file"]), s["reverse_trim"], "reverse_pos")
-    if not reads:
-        return
-    choice = st.radio(t("chrom_read"), list(reads), horizontal=True, key=f"cr_{name}",
-                      format_func=lambda k: t("chrom_fwd") if k == "forward" else t("chrom_rev"))
-    path, trim, pos_key = reads[choice]
+    name, seq, quals, L = s["sample_name"], s["consensus_seq"], s["consensus_quals"], s["consensus_length"]
+    dis = s["disagreements"]
+    dis_pos = [d["consensus_pos"] for d in dis]
+    pos_key, ctr_key = f"cpos_{name}", f"ctr_{name}"
+    st.session_state[f"dis_{name}"] = dis_pos
+    st.session_state.setdefault(pos_key, dis_pos[0] if dis_pos else 1)
+    st.session_state.setdefault(ctr_key, 0)
+    st.session_state[pos_key] = max(1, min(L, st.session_state[pos_key]))
+
+    # 1) clickable consensus map
+    st.caption(t("chrom_click_hint"))
+    ev = st.plotly_chart(
+        chrom.make_consensus_map(seq, quals, set(dis_pos), st.session_state[pos_key]),
+        key=f"map_{name}_{st.session_state[ctr_key]}", on_select="rerun",
+        selection_mode="points", config={"displayModeBar": False})
     try:
-        trace = get_trace(path)
+        pts = ev.selection.points
+    except Exception:  # noqa: BLE001
+        pts = []
+    if pts and pts[0].get("point_index") is not None:
+        st.session_state[pos_key] = int(pts[0]["point_index"]) + 1
+        st.session_state[ctr_key] += 1          # fresh chart -> same base can be clicked again
+        st.rerun()
+    st.caption(f"🟩 {t('legend_hq')} · ⬜ {t('legend_lq')} · 🟨 {t('legend_amb')} · 🟧 {t('chrom_disagree_key')}")
+
+    # 2) navigation
+    c = st.columns([0.5, 0.5, 0.5, 0.5, 1.6, 2.2, 1.6])
+    c[0].button("◀", key=f"pv_{name}", on_click=_set_pos, args=(name, st.session_state[pos_key] - 1, L))
+    c[1].button("▶", key=f"nx_{name}", on_click=_set_pos, args=(name, st.session_state[pos_key] + 1, L))
+    c[2].button("⏮", key=f"pd_{name}", on_click=_next_dis, args=(name, -1), disabled=not dis_pos,
+                help=t("chrom_prev_dis"))
+    c[3].button("⏭", key=f"nd_{name}", on_click=_next_dis, args=(name, 1), disabled=not dis_pos,
+                help=t("chrom_next_dis"))
+    c[4].number_input(t("chrom_cpos"), 1, max(1, L), key=pos_key)
+    c[5].selectbox(t("chrom_goto"), [None] + list(range(len(dis))), key=f"cg_{name}", on_change=_jump,
+                   args=(name,),
+                   format_func=lambda i: t("chrom_none") if i is None else
+                   f"#{dis[i]['consensus_pos']}  F:{dis[i]['forward_base']}(Q{dis[i]['forward_q']}) "
+                   f"R:{dis[i]['reverse_base']}(Q{dis[i]['reverse_q']}) → {dis[i]['call']}")
+    window = c[6].select_slider(t("chrom_window"), [20, 40, 60, 100], value=40, key=f"cw_{name}")
+
+    # 3) both reads around the selected consensus base
+    cpos = st.session_state[pos_key]
+    st.markdown(f"**{t('chrom_cpos')} {cpos}:** `{seq[cpos - 1]}` · Q{quals[cpos - 1]} · "
+                f"{t('chrom_source')}: {s['consensus_src'][cpos - 1]}")
+    ab1 = os.path.join(out_dir, name, "ab1")
+    fm, rm = s["consensus_fmap"][cpos - 1], s["consensus_rmap"][cpos - 1]
+    panels = []
+    try:
+        if s["forward_file"]:
+            if fm >= 0:
+                tr = get_trace(os.path.join(ab1, s["forward_file"]))
+                c1 = fm + 1
+                panels.append({"label": f"{t('chrom_fwd')} — {t('chrom_base')} {c1}: "
+                                        f"{tr['bases'][c1 - 1]} (Q{tr['quals'][c1 - 1]})",
+                               "trace": tr, "center": c1, "trim": tuple(s["forward_trim"])})
+            else:
+                st.info(t("chrom_nocover", read=t("chrom_fwd")))
+        if s["reverse_file"]:
+            if rm >= 0:
+                tr = get_trace_rc(os.path.join(ab1, s["reverse_file"]))
+                n = len(tr["bases"])
+                c1 = n - rm                      # 1-based position in the reverse-complemented trace
+                e0, e1 = s["reverse_trim"]
+                panels.append({"label": f"{t('chrom_rev')} — {t('chrom_base')} {c1}: "
+                                        f"{tr['bases'][c1 - 1]} (Q{tr['quals'][c1 - 1]})",
+                               "trace": tr, "center": c1, "trim": (n - e1, n - e0)})
+            else:
+                st.info(t("chrom_nocover", read=t("chrom_rev")))
     except Exception as e:  # noqa: BLE001
         st.error(t("chrom_error", err=e))
         return
-    n = len(trace["bases"])
-    conv = lambda p: p                      # original position -> position shown
-    if choice == "reverse":                 # show reverse-complemented: matches table + consensus
-        trace = chrom.reverse_complement_trace(trace)
-        trim = (n - trim[1], n - trim[0])
-        conv = lambda p: n - p + 1
-    dis = s["disagreements"]
-    c1, c2, c3 = st.columns([2, 1, 3])
-    with c1:
-        sel = st.selectbox(t("chrom_goto"), [None] + list(range(len(dis))), key=f"cg_{name}_{choice}",
-                           format_func=lambda i: t("chrom_none") if i is None else
-                           f"#{dis[i]['consensus_pos']}  F:{dis[i]['forward_base']}(Q{dis[i]['forward_q']}) "
-                           f"R:{dis[i]['reverse_base']}(Q{dis[i]['reverse_q']}) → {dis[i]['call']}")
-    with c2:
-        window = st.select_slider(t("chrom_window"), [30, 60, 100, 150], value=60, key=f"cw_{name}_{choice}")
-    with c3:
-        default = min(n, max(1, trim[0] + 30))
-        center = st.slider(t("chrom_center"), 1, max(2, n), default, key=f"cc_{name}_{choice}")
-    highlight = None
-    if sel is not None:
-        highlight = center = conv(dis[sel][pos_key])
-    fig = chrom.make_figure(trace, center, window, trim=tuple(trim), highlight=highlight)
-    st.plotly_chart(fig, key=f"fig_{name}_{choice}_{center}_{window}")
-    st.caption(t("chrom_hint"))
+    if panels:
+        st.plotly_chart(chrom.make_stacked_figure(panels, window), key=f"fig_{name}_{cpos}_{window}")
+        st.caption(t("chrom_hint"))
 
 
 def tab_differences(s):

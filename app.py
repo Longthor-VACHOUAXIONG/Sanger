@@ -222,6 +222,11 @@ def tab_chromatogram(s, out_dir):
         st.error(t("chrom_error", err=e))
         return
     n = len(trace["bases"])
+    conv = lambda p: p                      # original position -> position shown
+    if choice == "reverse":                 # show reverse-complemented: matches table + consensus
+        trace = chrom.reverse_complement_trace(trace)
+        trim = (n - trim[1], n - trim[0])
+        conv = lambda p: n - p + 1
     dis = s["disagreements"]
     c1, c2, c3 = st.columns([2, 1, 3])
     with c1:
@@ -236,7 +241,7 @@ def tab_chromatogram(s, out_dir):
         center = st.slider(t("chrom_center"), 1, max(2, n), default, key=f"cc_{name}_{choice}")
     highlight = None
     if sel is not None:
-        highlight = center = dis[sel][pos_key]
+        highlight = center = conv(dis[sel][pos_key])
     fig = chrom.make_figure(trace, center, window, trim=tuple(trim), highlight=highlight)
     st.plotly_chart(fig, key=f"fig_{name}_{choice}_{center}_{window}")
     st.caption(t("chrom_hint"))

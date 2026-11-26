@@ -34,6 +34,20 @@ def load_trace(path: str) -> dict:
     return {"channels": channels, "ploc": ploc[:n], "bases": bases[:n], "quals": quals[:n]}
 
 
+_COMP = {"A": "T", "C": "G", "G": "C", "T": "A", "N": "N"}
+
+
+def reverse_complement_trace(trace: dict) -> dict:
+    """Mirror a trace so it reads in the reverse-complement orientation."""
+    length = max(len(d) for d in trace["channels"].values())
+    return {
+        "channels": {_COMP.get(b, "N"): d[::-1] for b, d in trace["channels"].items()},
+        "ploc": [length - 1 - p for p in reversed(trace["ploc"])],
+        "bases": "".join(_COMP.get(b, "N") for b in reversed(trace["bases"])),
+        "quals": list(reversed(trace["quals"])),
+    }
+
+
 def make_figure(trace: dict, center: int = 1, window: int = 60, trim=None, highlight=None):
     """
     center / highlight are 1-based base positions in the original read.

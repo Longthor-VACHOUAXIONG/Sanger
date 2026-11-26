@@ -1,473 +1,375 @@
 #!/usr/bin/env python3
 """
-Sanger Sequencing Data analysis workflow
-Streamlit interface for uploading AB1 files, running the pipeline, and viewing results.
-Supports English and Lao (Noto Sans Lao).
+Sanger Sequencing Data Analysis - Streamlit app (English + Lao)
+Upload AB1 files -> consensus, chromatogram viewer, F/R disagreement review,
+optional mutation report vs a reference, ZIP / HTML report download.
 """
 
 import os
-import json
 import shutil
 import tempfile
-import base64
+import time
 import traceback
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 
 import streamlit as st
 
-from sanger_workflow import run_workflow as workflow_run
-from sanger_wrapper import run_batch_workflow
-from i18n import LANGUAGES, set_lang, t, inject_font
+import chromatogram as chrom
+import sanger_workflow as wf
+import sanger_wrapper as wr
+import i18n_extra  # noqa: F401  (registers the extra translations)
 from donate import render_donate
+from i18n import LANGUAGES, inject_font, set_lang, t
 
-# Global exception handler to show full traceback in Streamlit
-def _excepthook(exc_type, exc_value, exc_tb):
-    st.error(f"Unhandled exception: {exc_type.__name__}: {exc_value}")
-    st.code("".join(traceback.format_exception(exc_type, exc_value, exc_tb)), language="text")
-
-import sys
-sys.excepthook = _excepthook
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
 OUTPUT_BASE = os.path.join(tempfile.gettempdir(), "sanger_output")
 os.makedirs(OUTPUT_BASE, exist_ok=True)
+EXAMPLE_DIR = Path(__file__).parent / "examples"
+FEEDBACK_URL = ""  # e.g. "https://forms.gle/..." or "mailto:you@example.com"
 
-# Internal (language-independent) mode keys
-MODE_SINGLE = "single"
-MODE_MULTI = "multi"
+MODE_SINGLE, MODE_MULTI = "single", "multi"
 
+st.set_page_config(page_title="Sanger Workflow", page_icon="🧬", layout="wide",
+                   initial_sidebar_state="expanded")
+st.markdown("<style>.block-container{padding-top:1.2rem}</style>", unsafe_allow_html=True)
 
-# ---------------------------------------------------------------------------
-# Page config
-# ---------------------------------------------------------------------------
-st.set_page_config(
-    page_title="Sanger Workflow",
-    page_icon="🧬",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-st.markdown("""
-<style>
-    .stMetric .metric-value { font-size: 1.5rem; }
-    .block-container { padding-top: 1rem; }
-    .quality-excellent { color: #27ae60; font-weight: bold; }
-    .quality-good { color: #2ecc71; font-weight: bold; }
-    .quality-fair { color: #f39c12; font-weight: bold; }
-    .quality-poor { color: #e74c3c; font-weight: bold; }
-    div[data-testid="stExpander"] { border: 1px solid #e0e0e0; border-radius: 8px; }
-</style>
-""", unsafe_allow_html=True)
+for k, v in {"stats": None, "errors": [], "unmatched": [], "out_dir": "", "elapsed": 0.0}.items():
+    st.session_state.setdefault(k, v)
 
 
 # ---------------------------------------------------------------------------
-# Helper functions
+# Helpers
 # ---------------------------------------------------------------------------
+def consensus_html(seq, quals, width=60):
+    rows = []
+    for start in range(0, len(seq), width):
+        cells = []
+        for j, (b, q) in enumerate(zip(seq[start:start + width], quals[start:start + width])):
+            if b in "NRYSWKMBDHV":
+                cell = f'<span style="background:#ffd54f;color:#000;border-radius:2px">{b}</span>'
+            elif q < 20:
+                cell = f'<span style="color:#9e9e9e">{b}</span>'
+            else:
+                cell = b
+            cells.append(cell + ("&thinsp;" if (j + 1) % 10 == 0 else ""))
+        rows.append(f'<div><span style="color:#888;display:inline-block;width:3.6em">{start + 1}</span>'
+                    f'{"".join(cells)}</div>')
+    return ('<div style="font-family:\'Source Code Pro\',monospace;font-size:15px;'
+            f'line-height:1.7;letter-spacing:1px;overflow-x:auto">{"".join(rows)}</div>')
 
-def run_workflow(forward_dir, reverse_dir, output_dir, trim_quality=0.05, sample_name=None, status_container=None, progress_bar=None):
-    """Run sanger_workflow.py directly (no subprocess)."""
-    result = workflow_run(forward_dir, reverse_dir, output_dir, trim_quality=trim_quality, sample_name=sample_name)
-    if isinstance(result, tuple) and len(result) == 2:
-        returncode, output = result
-    elif isinstance(result, int):
-        returncode, output = result, ""
-    else:
-        returncode, output = 0, str(result)
-    return returncode, output, 0
+
+@st.cache_data(show_spinner=False)
+def get_trace(path):
+    return chrom.load_trace(path)
 
 
-def run_wrapper_batch(upload_dir, output_dir, trim_quality=0.05, status_container=None, progress_bar=None):
-    """Run sanger_wrapper.py batch mode directly (no subprocess)."""
+def file_bytes(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def run_jobs(jobs, unmatched, trim_quality, reference):
+    """Run all jobs, store results in session_state."""
+    old = st.session_state.get("out_dir")
+    if old:
+        shutil.rmtree(old, ignore_errors=True)
+    out_dir = os.path.join(OUTPUT_BASE, f"run_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}")
+    prog = st.progress(0.0)
+
+    def cb(i, n, name):
+        if name:
+            prog.progress(i / n, text=t("progress", name=name, i=i + 1, n=n))
+
+    t0 = time.perf_counter()
     try:
-        result = run_batch_workflow(upload_dir, output_dir, trim_quality=trim_quality)
-    except Exception as e:
-        return 1, f"Batch wrapper error: {e}\n" + traceback.format_exc(), 0
-    if isinstance(result, tuple) and len(result) == 2:
-        returncode, output = result
-    elif isinstance(result, int):
-        returncode, output = result, ""
-    else:
-        returncode, output = 0, str(result)
-    return returncode, output, 0
-
-
-def load_json(path):
-    if os.path.exists(path):
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    return None
-
-
-def load_sample_stats(output_dir):
-    return load_json(os.path.join(output_dir, "sample_stats.json"))
-
-
-def load_all_sample_stats(output_dir):
-    return load_json(os.path.join(output_dir, "all_sample_stats.json"))
-
-
-def read_fasta(filepath):
-    """Read a FASTA file and return header + sequence."""
-    if not os.path.exists(filepath):
-        return None, None
-    with open(filepath) as f:
-        lines = f.readlines()
-    header, seq = "", ""
-    for line in lines:
-        if line.startswith(">"):
-            header = line.strip()[1:]
-        else:
-            seq += line.strip()
-    return header, seq
-
-
-def get_download_link(filepath, filename=None):
-    """Generate a download link for a file."""
-    if not os.path.exists(filepath):
-        return None
-    with open(filepath, "rb") as f:
-        data = f.read()
-    b64 = base64.b64encode(data).decode()
-    if filename is None:
-        filename = os.path.basename(filepath)
-    return f'<a href="data:file/octet-stream;base64,{b64}" download="{filename}">⬇️ {filename}</a>'
-
-
-def show_download(filepath, filename):
-    link = get_download_link(filepath, filename)
-    if link:
-        st.markdown(link, unsafe_allow_html=True)
-
-
-def cleanup_session(session_id):
-    output_dir = os.path.join(OUTPUT_BASE, session_id)
-    if os.path.exists(output_dir):
-        shutil.rmtree(output_dir, ignore_errors=True)
-
-
-def init_session_state():
-    defaults = {
-        "run_returncode": None,
-        "run_output": "",
-        "run_elapsed": 0,
-        "run_output_dir": "",
-        "run_session_id": "",
-        "run_mode": MODE_SINGLE,
-    }
-    for key, value in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = value
+        stats, errors = wr.run_batch(jobs, out_dir, trim_quality, reference, cb)
+    except Exception as e:  # noqa: BLE001
+        stats, errors = [], [("run", f"{e}\n{traceback.format_exc()}")]
+    prog.empty()
+    st.session_state.update(stats=stats, errors=errors, unmatched=unmatched, out_dir=out_dir,
+                            elapsed=round(time.perf_counter() - t0, 1))
 
 
 # ---------------------------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------------------------
-
 with st.sidebar:
-    lang = st.radio(
-        "Language / ພາສາ",
-        options=list(LANGUAGES.keys()),
-        format_func=lambda k: LANGUAGES[k],
-        horizontal=True,
-        key="lang",
-    )
+    lang = st.radio("Language / ພາສາ", list(LANGUAGES), format_func=lambda k: LANGUAGES[k],
+                    horizontal=True, key="lang")
     set_lang(lang)
-    inject_font()  # Noto Sans Lao
+    inject_font()
 
     st.title(t("title"))
     st.markdown("---")
-    st.markdown(t("sidebar_pipeline"))
-    st.markdown(t("steps_title"))
-    st.markdown(t("steps"))
-    st.markdown("---")
     st.markdown(f"### {t('settings')}")
-    trim_quality = st.slider(
-        t("trim_label"),
-        min_value=0.01,
-        max_value=0.20,
-        value=0.05,
-        step=0.01,
-        help=t("trim_help"),
-    )
+    trim_quality = st.slider(t("trim_label"), 0.01, 0.20, 0.05, 0.01, help=t("trim_help"))
+
     st.markdown("---")
-    st.markdown(f"### {t('links')}")
+    st.markdown(f"### {t('ref_title')}")
+    st.caption(t("ref_help"))
+    ref_text = st.text_area(t("ref_text"), height=110, label_visibility="collapsed",
+                            placeholder=">my_gene\nATGGCC...")
+    ref_file = st.file_uploader(t("ref_upload"), type=["fasta", "fa", "fna", "txt"], key="ref_file")
+    if ref_file is not None:
+        ref_text = ref_file.getvalue().decode("utf-8", "ignore")
+    reference = None
+    try:
+        reference = wf.parse_reference(ref_text)
+        if reference:
+            st.success(t("ref_ok", name=reference[0], n=len(reference[1])))
+    except ValueError as e:
+        st.error(t("ref_invalid", err=e))
+
+    st.markdown("---")
     st.markdown(f"[{t('usage')}](./USAGE.md)")
-    st.markdown("---")
+    if FEEDBACK_URL:
+        st.link_button(t("feedback"), FEEDBACK_URL)
     st.markdown(f"<small>{t('cleanup_hint')}</small>", unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------------------
-# Main content
+# Header + input
 # ---------------------------------------------------------------------------
-
 st.title(t("title"))
-st.markdown(t("intro"))
+st.subheader(t("hero"))
+st.caption(t("privacy"))
 
-render_donate(expanded=True)  # donate box at the top, open by default
+example_jobs = []
+if EXAMPLE_DIR.exists():
+    example_jobs, _ = wr.pair_files(wr.find_ab1([str(EXAMPLE_DIR)]))
+if example_jobs and st.session_state.stats is None:
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        try_example = st.button(t("try_example"), type="secondary")
+    with c2:
+        st.caption(t("example_hint"))
+    if try_example:
+        run_jobs(example_jobs, [], trim_quality, reference)
+        st.rerun()
 
-mode = st.radio(
-    t("mode_label"),
-    [MODE_SINGLE, MODE_MULTI],
-    format_func=lambda m: t("mode_single") if m == MODE_SINGLE else t("mode_multi"),
-    horizontal=True,
-)
-
+mode = st.radio(t("mode_label"), [MODE_SINGLE, MODE_MULTI], horizontal=True,
+                format_func=lambda m: t("mode_single") if m == MODE_SINGLE else t("mode_multi"))
 st.markdown(t("upload_header"))
 
+fwd_up = rev_up = all_up = None
 if mode == MODE_SINGLE:
-    col1, col2 = st.columns(2)
-    with col1:
-        forward_files = st.file_uploader(
-            t("fwd_label"), type=["ab1"], accept_multiple_files=True, key="fwd",
-        )
-    with col2:
-        reverse_files = st.file_uploader(
-            t("rev_label"), type=["ab1"], accept_multiple_files=True, key="rev",
-        )
-else:
-    all_files = st.file_uploader(
-        t("mixed_label"), type=["ab1"], accept_multiple_files=True,
-        key="mixed", help=t("mixed_help"),
-    )
-
-st.markdown("---")
-
-run_disabled = False
-if mode == MODE_SINGLE:
-    if not forward_files or not reverse_files:
-        run_disabled = True
+    st.caption(t("single_hint"))
+    c1, c2 = st.columns(2)
+    fwd_up = c1.file_uploader(t("fwd_one"), type=["ab1"], key="fwd1")
+    rev_up = c2.file_uploader(t("rev_one"), type=["ab1"], key="rev1")
+    disabled = not (fwd_up or rev_up)
+    if disabled:
         st.info(t("info_single"))
 else:
-    if not all_files:
-        run_disabled = True
+    all_up = st.file_uploader(t("mixed_label"), type=["ab1"], accept_multiple_files=True,
+                              key="mixed", help=t("mixed_help"))
+    disabled = not all_up
+    if disabled:
         st.info(t("info_multi"))
 
-if st.button(t("run"), type="primary", disabled=run_disabled):
-    session_id = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    output_dir = os.path.join(OUTPUT_BASE, session_id)
-    os.makedirs(output_dir, exist_ok=True)
-
-    with tempfile.TemporaryDirectory(prefix="sanger_uploads_") as upload_tmp:
-        returncode = None
-        output = ""
-        elapsed = 0
+if st.button(t("run"), type="primary", disabled=disabled):
+    with tempfile.TemporaryDirectory(prefix="sanger_uploads_") as tmp:
+        def save(upload):
+            path = os.path.join(tmp, os.path.basename(upload.name))
+            with open(path, "wb") as fh:
+                fh.write(upload.getbuffer())
+            return path
 
         if mode == MODE_SINGLE:
-            fwd_dir = os.path.join(upload_tmp, "forward")
-            rev_dir = os.path.join(upload_tmp, "reverse")
-            os.makedirs(fwd_dir, exist_ok=True)
-            os.makedirs(rev_dir, exist_ok=True)
-
-            for f in forward_files:
-                with open(os.path.join(fwd_dir, f.name), "wb") as out:
-                    out.write(f.getbuffer())
-            for f in reverse_files:
-                with open(os.path.join(rev_dir, f.name), "wb") as out:
-                    out.write(f.getbuffer())
-
-            st.success(t("saved_pair", nf=len(forward_files), nr=len(reverse_files)))
-
-            sample_name = None
-            if forward_files:
-                stem = Path(forward_files[0].name).stem
-                for suffix in ["_forward", "_Forward", "_fwd", "_F"]:
-                    if stem.endswith(suffix):
-                        stem = stem[: -len(suffix)]
-                sample_name = stem
-
-            with st.status(t("running"), expanded=True) as status:
-                st.write(t("setup"))
-                progress_bar = st.progress(0, text=t("starting"))
-                returncode, output, elapsed = run_workflow(
-                    fwd_dir, rev_dir, output_dir, trim_quality,
-                    sample_name=sample_name,
-                    status_container=status, progress_bar=progress_bar,
-                )
-                if returncode == 0:
-                    status.update(label=t("done", s=elapsed), state="complete")
-                else:
-                    status.update(label=t("failed", s=elapsed), state="error")
-
+            f = save(fwd_up) if fwd_up else None
+            r = save(rev_up) if rev_up else None
+            name = wr.sample_name_from_file((fwd_up or rev_up).name)
+            jobs, unmatched = [(name, f, r)], []
         else:
-            upload_dir = os.path.join(upload_tmp, session_id)
-            os.makedirs(upload_dir, exist_ok=True)
+            jobs, unmatched = wr.pair_files([save(u) for u in all_up])
+        if jobs:
+            run_jobs(jobs, [os.path.basename(u) for u in unmatched], trim_quality, reference)
+        else:
+            st.session_state.update(stats=[], errors=[("-", t("no_files_ok"))], unmatched=[],
+                                    out_dir="", elapsed=0.0)
 
-            for f in all_files:
-                with open(os.path.join(upload_dir, f.name), "wb") as out:
-                    out.write(f.getbuffer())
 
-            st.success(t("saved_n", n=len(all_files)))
+# ---------------------------------------------------------------------------
+# Results
+# ---------------------------------------------------------------------------
+def tab_consensus(s, out_dir):
+    st.markdown(consensus_html(s["consensus_seq"], s["consensus_quals"]), unsafe_allow_html=True)
+    st.caption(f"{t('legend')}: ◼ {t('legend_hq')} · "
+               f"<span style='color:#9e9e9e'>◼ {t('legend_lq')}</span> · "
+               f"<span style='background:#ffd54f;color:#000'>&nbsp;◼ {t('legend_amb')}&nbsp;</span>",
+               unsafe_allow_html=True)
+    st.code(f">{s['sample_name']}\n{s['consensus_seq']}", language="text")
+    st.download_button(t("dl_fasta"), f">{s['sample_name']}\n{s['consensus_seq']}\n",
+                       file_name=f"{s['sample_name']}_consensus.fasta", key=f"dlc_{s['sample_name']}")
 
-            try:
-                with st.status(t("batch_running"), expanded=True) as status:
-                    st.write(t("detect_pairs"))
-                    progress_bar = st.progress(0, text=t("starting"))
-                    returncode, output, elapsed = run_wrapper_batch(
-                        upload_dir, output_dir, trim_quality,
-                        status_container=status, progress_bar=progress_bar,
-                    )
-                    if returncode == 0:
-                        status.update(label=t("batch_done", s=elapsed), state="complete")
-                    else:
-                        status.update(label=t("batch_failed", s=elapsed), state="error")
-            except Exception as e:
-                returncode = 1
-                output = f"Error: {e}\n" + traceback.format_exc()
-                elapsed = 0
 
-    st.session_state.run_returncode = returncode
-    st.session_state.run_output = output
-    st.session_state.run_elapsed = elapsed
-    st.session_state.run_output_dir = output_dir
-    st.session_state.run_session_id = session_id
-    st.session_state.run_mode = mode
+def tab_chromatogram(s, out_dir):
+    name = s["sample_name"]
+    ab1 = os.path.join(out_dir, name, "ab1")
+    reads = {}
+    if s["forward_file"]:
+        reads["forward"] = (os.path.join(ab1, s["forward_file"]), s["forward_trim"], "forward_pos")
+    if s["reverse_file"]:
+        reads["reverse"] = (os.path.join(ab1, s["reverse_file"]), s["reverse_trim"], "reverse_pos")
+    if not reads:
+        return
+    choice = st.radio(t("chrom_read"), list(reads), horizontal=True, key=f"cr_{name}",
+                      format_func=lambda k: t("chrom_fwd") if k == "forward" else t("chrom_rev"))
+    path, trim, pos_key = reads[choice]
+    try:
+        trace = get_trace(path)
+    except Exception as e:  # noqa: BLE001
+        st.error(t("chrom_error", err=e))
+        return
+    n = len(trace["bases"])
+    dis = s["disagreements"]
+    c1, c2, c3 = st.columns([2, 1, 3])
+    with c1:
+        sel = st.selectbox(t("chrom_goto"), [None] + list(range(len(dis))), key=f"cg_{name}_{choice}",
+                           format_func=lambda i: t("chrom_none") if i is None else
+                           f"#{dis[i]['consensus_pos']}  F:{dis[i]['forward_base']}(Q{dis[i]['forward_q']}) "
+                           f"R:{dis[i]['reverse_base']}(Q{dis[i]['reverse_q']}) → {dis[i]['call']}")
+    with c2:
+        window = st.select_slider(t("chrom_window"), [30, 60, 100, 150], value=60, key=f"cw_{name}_{choice}")
+    with c3:
+        default = min(n, max(1, trim[0] + 30))
+        center = st.slider(t("chrom_center"), 1, max(2, n), default, key=f"cc_{name}_{choice}")
+    highlight = None
+    if sel is not None:
+        highlight = center = dis[sel][pos_key]
+    fig = chrom.make_figure(trace, center, window, trim=tuple(trim), highlight=highlight)
+    st.plotly_chart(fig, key=f"fig_{name}_{choice}_{center}_{window}")
+    st.caption(t("chrom_hint"))
 
-init_session_state()
-returncode = st.session_state.run_returncode
-output = st.session_state.run_output
-elapsed = st.session_state.run_elapsed
-output_dir = st.session_state.run_output_dir
-session_id = st.session_state.run_session_id
-run_mode = st.session_state.run_mode
 
-# ---- Show results ----
-if returncode is not None:
-    if returncode == 0:
-        st.success(t("final_ok", s=elapsed))
+def tab_differences(s):
+    st.markdown(f"#### {t('disagree_title')}")
+    dis = s["disagreements"]
+    if not dis:
+        st.success(t("disagree_none"))
     else:
-        st.error(t("final_fail"))
+        st.caption(t("disagree_hint"))
+        st.dataframe([{
+            t("col_cpos"): d["consensus_pos"], t("col_call"): d["call"], t("col_how"): d["resolution"],
+            t("col_fpos"): d["forward_pos"], t("col_fbase"): d["forward_base"], t("col_fq"): d["forward_q"],
+            t("col_rpos"): d["reverse_pos"], t("col_rbase"): d["reverse_base"], t("col_rq"): d["reverse_q"],
+        } for d in dis], hide_index=True)
 
-    with st.expander(t("full_output"), expanded=False):
-        st.code(output, language="text")
+    st.markdown(f"#### {t('var_title')}")
+    ref = s.get("reference")
+    if not ref:
+        st.info(t("var_none_ref"))
+        return
+    st.caption(t("var_summary", name=ref["reference_name"], ident=ref["identity"],
+                 cov=ref["ref_coverage_pct"], strand=ref["strand"]))
+    if not ref["variants"]:
+        st.success(t("var_zero"))
+    else:
+        st.dataframe([{
+            t("col_type"): v["type"], t("col_refpos"): v["ref_pos"], t("col_ref"): v["ref"],
+            t("col_alt"): v["alt"], t("col_cpos"): v["consensus_pos"], t("col_q"): v["quality"],
+        } for v in ref["variants"]], hide_index=True)
 
+
+def tab_details(s):
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown(f"**{t('fwd_file')}:** {s['forward_file'] or '—'}")
+        st.markdown(f"**{t('rev_file')}:** {s['reverse_file'] or '—'}")
+        st.markdown(f"**{t('raw_len')}:** {s['forward_raw_length']} / {s['reverse_raw_length']} bp")
+        st.markdown(f"**{t('trim_len')}:** {s['forward_trimmed_length']} / {s['reverse_trimmed_length']} bp")
+        st.markdown(f"**{t('aln_len')}:** {s['alignment_length']} bp")
+    with c2:
+        st.markdown(f"**{t('valid_bases')}:** {s['valid_bases']} ({s['coverage_pct']:.1f}%)")
+        st.markdown(f"**{t('amb_bases')}:** {s['ambiguous_bases']} ({s['ambiguity_pct']:.1f}%)")
+        st.markdown(f"**{t('n_bases')}:** {s['n_bases']} ({s['n_pct']:.1f}%)")
+        st.markdown(f"**{t('fwd_q')}:** Phred {s['forward_avg_quality']:.1f}")
+        st.markdown(f"**{t('rev_q')}:** Phred {s['reverse_avg_quality']:.1f}")
+        st.markdown(f"**{t('details_meanq')}:** Phred {s['mean_consensus_quality']:.1f}")
+        st.markdown(f"**{t('details_time')}:** {s['elapsed_s']} s")
+
+
+def show_sample(s, out_dir):
+    c = st.columns(6)
+    c[0].metric(t("m_consensus"), f"{s['consensus_length']} bp")
+    c[1].metric(t("m_gc"), f"{s['gc_content']:.1f}%")
+    c[2].metric(t("m_q20"), f"{s['q20_pct']:.0f}%")
+    c[3].metric(t("m_amb"), f"{s['ambiguity_pct']:.1f}%")
+    c[4].metric(t("m_disagree"), len(s["disagreements"]))
+    c[5].metric(t("m_rating"), t(s["quality_rating"]))
+    st.caption(f"{t('col_mode')}: {t('mode_' + s['mode'])}"
+               + (f" · {t('m_overlap')}: {s['overlap_length']} bp ({s['overlap_identity']:.0f}%)"
+                  if s["mode"] == "paired" else ""))
+    for w in s["warnings"]:
+        st.warning(w)
+
+    tabs = st.tabs([t("tab_consensus"), t("tab_chrom"), t("tab_variants"), t("tab_details")])
+    with tabs[0]:
+        tab_consensus(s, out_dir)
+    with tabs[1]:
+        tab_chromatogram(s, out_dir)
+    with tabs[2]:
+        tab_differences(s)
+    with tabs[3]:
+        tab_details(s)
+
+
+stats = st.session_state.stats
+if stats is not None:
+    out_dir = st.session_state.out_dir
     st.markdown("---")
     st.markdown(t("results"))
 
-    if run_mode == MODE_SINGLE:
-        stats = load_sample_stats(output_dir)
-        if stats:
-            col1, col2, col3, col4, col5 = st.columns(5)
-            with col1:
-                st.metric(t("m_consensus"), f"{stats['consensus_length']} bp")
-            with col2:
-                st.metric(t("m_gc"), f"{stats['gc_content']:.1f}%")
-            with col3:
-                st.metric(t("m_amb"), f"{stats['ambiguity_pct']:.1f}%")
-            with col4:
-                st.metric(t("m_cov"), f"{stats['coverage_pct']:.1f}%")
-            with col5:
-                st.metric(t("m_rating"), t(stats["quality_rating"]))
+    for sample, msg in st.session_state.errors:
+        st.error(f"{t('errors_title')}: **{sample}** — {msg}")
+    if st.session_state.unmatched:
+        st.warning(t("unmatched", n=len(st.session_state.unmatched),
+                     names=", ".join(st.session_state.unmatched[:8])))
 
-            with st.expander(t("detailed")):
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.markdown(f"**{t('fwd_file')}:** {stats['forward_file']}")
-                    st.markdown(f"**{t('rev_file')}:** {stats['reverse_file']}")
-                    st.markdown(f"**{t('raw_len')}:** {stats['forward_raw_length']} / {stats['reverse_raw_length']} bp")
-                    st.markdown(f"**{t('trim_len')}:** {stats['forward_trimmed_length']} / {stats['reverse_trimmed_length']} bp")
-                    st.markdown(f"**{t('aln_len')}:** {stats['alignment_length']} bp")
-                with col2:
-                    st.markdown(f"**{t('valid_bases')}:** {stats['valid_bases']} ({stats['coverage_pct']:.1f}%)")
-                    st.markdown(f"**{t('amb_bases')}:** {stats['ambiguous_bases']} ({stats['ambiguity_pct']:.1f}%)")
-                    st.markdown(f"**{t('n_bases')}:** {stats['n_bases']} ({stats['n_pct']:.1f}%)")
-                    st.markdown(f"**{t('fwd_q')}:** Phred {stats['forward_avg_quality']:.1f}")
-                    st.markdown(f"**{t('rev_q')}:** Phred {stats['reverse_avg_quality']:.1f}")
+    if stats:
+        st.success(t("run_done", n=len(stats), s=st.session_state.elapsed))
 
-        consensus_path = os.path.join(output_dir, "consensus.fasta")
-        header, seq = read_fasta(consensus_path)
-        if seq:
-            with st.expander(t("consensus_seq"), expanded=True):
-                st.code(f">{header}\n{seq}", language="text")
-                show_download(consensus_path, "consensus.fasta")
+        # downloads
+        zip_path = wr.make_zip(out_dir)
+        d = st.columns(4)
+        d[0].download_button(t("dl_zip"), file_bytes(zip_path), file_name="sanger_results.zip", type="primary")
+        d[1].download_button(t("dl_report"), file_bytes(os.path.join(out_dir, "quality_report.html")),
+                             file_name="quality_report.html", mime="text/html")
+        d[2].download_button(t("dl_fasta"), file_bytes(os.path.join(out_dir, "all_consensus.fasta")),
+                             file_name="all_consensus.fasta")
+        d[3].download_button(t("dl_csv"), file_bytes(os.path.join(out_dir, "summary.csv")),
+                             file_name="summary.csv", mime="text/csv")
 
-        st.markdown(t("download"))
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            show_download(os.path.join(output_dir, "final_aligned.fasta"), "final_aligned.fasta")
-        with col2:
-            show_download(consensus_path, "consensus.fasta")
-        with col3:
-            show_download(os.path.join(output_dir, "sample_stats.json"), "sample_stats.json")
-
-    else:
-        all_stats = load_all_sample_stats(output_dir)
-        if all_stats:
-            n = len(all_stats)
-            avg_amb = sum(s["ambiguity_pct"] for s in all_stats) / n
-            avg_gc = sum(s["gc_content"] for s in all_stats) / n
-            avg_cov = sum(s["coverage_pct"] for s in all_stats) / n
-            avg_len = sum(s["consensus_length"] for s in all_stats) / n
-
-            col1, col2, col3, col4, col5 = st.columns(5)
-            with col1:
-                st.metric(t("samples"), n)
-            with col2:
-                st.metric(t("avg_consensus"), f"{avg_len:.0f} bp")
-            with col3:
-                st.metric(t("avg_gc"), f"{avg_gc:.1f}%")
-            with col4:
-                st.metric(t("avg_amb"), f"{avg_amb:.1f}%")
-            with col5:
-                st.metric(t("avg_cov"), f"{avg_cov:.1f}%")
-
-            rating_counts = {}
-            for s in all_stats:
-                r = s["quality_rating"]
-                rating_counts[r] = rating_counts.get(r, 0) + 1
-
-            st.markdown(t("quality_dist"))
-            cols = st.columns(4)
-            for c, name in zip(cols, ["Excellent", "Good", "Fair", "Poor"]):
-                with c:
-                    st.metric(t(name), rating_counts.get(name, 0))
-
+        if len(stats) > 1:
             st.markdown(t("sample_results"))
-            st.dataframe(
-                [
-                    {
-                        t("col_sample"): s["sample_name"],
-                        t("col_consensus"): s["consensus_length"],
-                        t("col_gc"): s["gc_content"],
-                        t("col_amb"): s["ambiguity_pct"],
-                        t("col_cov"): s["coverage_pct"],
-                        t("col_fwdqv"): s["forward_avg_quality"],
-                        t("col_revqv"): s["reverse_avg_quality"],
-                        t("col_rating"): t(s["quality_rating"]),
-                    }
-                    for s in all_stats
-                ],
-                use_container_width=True,
-                hide_index=True,
-            )
+            has_ref = any(s.get("reference") for s in stats)
+            st.dataframe([{
+                t("col_sample"): s["sample_name"], t("col_mode"): t("mode_" + s["mode"]),
+                t("col_consensus"): s["consensus_length"], t("col_gc"): s["gc_content"],
+                t("m_q20"): s["q20_pct"], t("col_amb"): s["ambiguity_pct"],
+                t("m_disagree"): len(s["disagreements"]),
+                **({t("col_nvar"): wr.n_variants(s)} if has_ref else {}),
+                t("col_rating"): t(s["quality_rating"]),
+            } for s in stats], hide_index=True)
+            names = [s["sample_name"] for s in stats]
+            chosen = st.selectbox(t("select_sample"), names, key="sample_pick")
+            current = stats[names.index(chosen)]
+        else:
+            current = stats[0]
+        show_sample(current, out_dir)
 
-        combined_path = os.path.join(output_dir, "all_consensus.fasta")
-        if os.path.exists(combined_path):
-            st.markdown(t("download"))
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                show_download(combined_path, "all_consensus.fasta")
-            with col2:
-                show_download(os.path.join(output_dir, "quality_report.html"), "quality_report.html")
-            with col3:
-                show_download(os.path.join(output_dir, "all_sample_stats.json"), "all_sample_stats.json")
-
-        st.markdown(t("individual"))
-        if all_stats:
-            for s in all_stats:
-                sample_name = s["sample_name"]
-                consensus_path = os.path.join(output_dir, sample_name, "consensus.fasta")
-                header, seq = read_fasta(consensus_path)
-                if seq:
-                    with st.expander(f"{sample_name} — {len(seq)} bp — {t(s['quality_rating'])}"):
-                        st.code(f">{header}\n{seq}", language="text")
+    if st.button(t("cleanup")):
+        shutil.rmtree(out_dir, ignore_errors=True)
+        if out_dir:
+            Path(out_dir.rstrip("/\\") + "_results.zip").unlink(missing_ok=True)
+        st.session_state.update(stats=None, errors=[], unmatched=[], out_dir="")
+        st.success(t("cleaned"))
+        st.rerun()
 
 st.markdown("---")
-if returncode is not None and st.button(t("cleanup")):
-    cleanup_session(session_id)
-    st.success(t("cleaned"))
-
-st.markdown("---")
+with st.expander(t("how_title")):
+    st.markdown(t("how_text"))
+    st.markdown(t("steps_title"))
+    st.markdown(t("steps"))
+render_donate(expanded=False)
 st.markdown(t("footer"), help=t("footer_help"))

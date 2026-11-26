@@ -1,840 +1,498 @@
 #!/usr/bin/env python3
 """
-Sanger Sequencing Workflow
+Sanger Sequencing Workflow (v2)
 
-Pipeline:
-  1. AB1 to FASTQ conversion (forward & reverse collections)
-  2. Quality trimming (seqtk trimfq equivalent, q=0.05 → Phred 13)
-  3. Sort collections alphabetically
-  4. FASTQ Groomer (ensure fastqsanger encoding)
-  5. Reverse complement (reverse reads)
-  6. Sort reversed collection alphabetically
-  7. Merge paired-end reads (interleaved FASTQ)
-  8. FASTQ Groomer (post-merge encoding fix)
-  9. FASTQ to Tabular conversion
-  10. Tabular to FASTA conversion
-  11. Align sequences (MAFFT)
-  12. Consensus from aligned FASTA (IUPAC ambiguity codes)
-  13. Regex header formatting
-  14. Final MAFFT alignment
+For each sample (forward and/or reverse AB1):
+  1. Read bases + Phred qualities with Biopython
+  2. Quality trimming (Mott algorithm, same as `seqtk trimfq -q`)
+  3. Reverse-complement the reverse read
+  4. Overlap-align forward and reverse reads (pure Python, no MAFFT needed)
+  5. Quality-aware consensus:
+       - agree            -> base, qualities combined
+       - disagree         -> higher quality wins if clearly better,
+                             otherwise an IUPAC ambiguity code (R, Y, ...)
+       - single-read ends -> that read's base
+  6. Optional: compare consensus to a reference and list mutations
+  7. Statistics + quality rating
+
+Only dependency: biopython.
 """
 
-import os
-import sys
-import re
-import math
-import json
-import glob
-import subprocess
 import argparse
-from collections import OrderedDict, Counter
+import csv
+import json
+import math
+import os
+import re
+import shutil
+import sys
+import time
+from collections import Counter
 
 from Bio import SeqIO
-from Bio.Seq import Seq
-from Bio.SeqRecord import SeqRecord
-from Bio.Align import MultipleSeqAlignment
-
+from Bio.Align import PairwiseAligner
 
 # ---------------------------------------------------------------------------
-# IUPAC ambiguity dictionary (used for consensus)
+# IUPAC helpers
 # ---------------------------------------------------------------------------
-IUPAC = {
-    frozenset(["A"]): "A",
-    frozenset(["T"]): "T", frozenset(["U"]): "T",
-    frozenset(["C"]): "C",
-    frozenset(["G"]): "G",
-    frozenset(["A", "T"]): "W",
-    frozenset(["C", "G"]): "S",
-    frozenset(["A", "G"]): "R",
-    frozenset(["C", "T"]): "Y",
-    frozenset(["G", "T"]): "K",
-    frozenset(["A", "C"]): "M",
-    frozenset(["A", "C", "G"]): "V",
-    frozenset(["A", "C", "T"]): "H",
-    frozenset(["A", "G", "T"]): "D",
-    frozenset(["C", "G", "T"]): "B",
-    frozenset(["A", "C", "G", "T"]): "N",
-}
-
 IUPAC_EXPANSION = {
-    "A": ["A"],
-    "T": ["T"],
-    "C": ["C"],
-    "G": ["G"],
-    "R": ["A", "G"],
-    "Y": ["C", "T"],
-    "W": ["A", "T"],
-    "S": ["G", "C"],
-    "K": ["G", "T"],
-    "M": ["A", "C"],
-    "B": ["C", "G", "T"],
-    "D": ["A", "G", "T"],
-    "H": ["A", "C", "T"],
-    "V": ["A", "C", "G"],
-    "N": ["A", "C", "G", "T"],
+    "A": "A", "C": "C", "G": "G", "T": "T",
+    "R": "AG", "Y": "CT", "W": "AT", "S": "CG", "K": "GT", "M": "AC",
+    "B": "CGT", "D": "AGT", "H": "ACT", "V": "ACG", "N": "ACGT",
 }
+IUPAC_CODE = {frozenset(v): k for k, v in IUPAC_EXPANSION.items()}
+AMBIGUOUS = set("RYSWKMBDHVN")
+
+_COMP = str.maketrans("ACGTRYSWKMBDHVNacgtryswkmbdhvn",
+                      "TGCAYRSWMKVHDBNtgcayrswmkvhdbn")
 
 
-# ===========================================================================
-# STEP 1 – AB1 to FASTQ
-# ===========================================================================
-def read_ab1_quality(ab1_path: str) -> list:
+def revcomp(seq: str) -> str:
+    return seq.translate(_COMP)[::-1]
+
+
+def _expand(base: str) -> str:
+    return IUPAC_EXPANSION.get(base, "ACGT")
+
+
+def _compatible(a: str, b: str) -> bool:
+    return bool(set(_expand(a)) & set(_expand(b)))
+
+
+# ---------------------------------------------------------------------------
+# Reading + trimming
+# ---------------------------------------------------------------------------
+def read_ab1(path: str) -> dict:
+    """Read an AB1 file -> {seq, quals, quality_missing}."""
+    rec = SeqIO.read(path, "abi")
+    seq = str(rec.seq).upper()
+    quals = list(rec.letter_annotations.get("phred_quality") or [])
+    missing = len(quals) != len(seq)
+    if missing:
+        quals = [20] * len(seq)
+    return {"seq": seq, "quals": quals, "quality_missing": missing}
+
+
+def mott_trim(quals, q: float = 0.05):
     """
-    Read quality scores directly from AB1 file using the PHRD tag.
-    This matches the ab1_fastq_converter which reads PHRD directly.
+    Modified Mott trimming (identical to seqtk trimfq).
+    Returns (start, end) of the best-scoring segment; (0, 0) if none.
     """
-    try:
-        import struct
-        with open(ab1_path, "rb") as f:
-            data = f.read()
-
-        # AB1 file format: look for PHRD tag (Phred quality scores)
-        # The PHRD tag contains quality scores as signed 32-bit integers
-        phrd_pos = data.find(b"PHRD")
-        if phrd_pos == -1:
-            # Try alternative tag names
-            for tag in [b"P1Acq", b"P9Acq", b"QUAL"]:
-                phrd_pos = data.find(tag)
-                if phrd_pos != -1:
-                    break
-
-        if phrd_pos == -1:
-            return None
-
-        # Skip tag name (4 bytes) and find data
-        # PHRD tag structure: tag_name(4) + data_size(4) + data...
-        # Data starts after the tag and size field
-        data_start = phrd_pos + 4  # Skip tag name
-
-        # Read data size (32-bit little-endian integer)
-        if data_start + 4 > len(data):
-            return None
-        data_size = struct.unpack("<I", data[data_start:data_start + 4])[0]
-
-        # Quality scores are stored as 32-bit signed integers
-        qual_start = data_start + 4
-        num_quals = data_size // 4  # Each quality is 4 bytes
-
-        if qual_start + num_quals * 4 > len(data):
-            return None
-
-        quals = []
-        for i in range(num_quals):
-            offset = qual_start + i * 4
-            qual = struct.unpack("<i", data[offset:offset + 4])[0]
-            # Clamp to valid Phred range (0-93)
-            qual = max(0, min(93, qual))
-            quals.append(qual)
-
-        return quals if quals else None
-
-    except Exception:
-        return None
+    best, best_start, best_end = 0.0, 0, 0
+    run, start = 0.0, 0
+    for i, Q in enumerate(quals):
+        run += q - min(1.0, 10 ** (-Q / 10))
+        if run < 0:
+            run, start = 0.0, i + 1
+        elif run > best:
+            best, best_start, best_end = run, start, i + 1
+    return best_start, best_end
 
 
-def ab1_to_fastq(ab1_path: str) -> SeqRecord:
+# ---------------------------------------------------------------------------
+# Pairwise alignment helpers
+# ---------------------------------------------------------------------------
+def _make_aligner(mode):
+    a = PairwiseAligner()
+    a.mode = mode
+    a.match_score = 2
+    a.mismatch_score = -3
+    a.open_gap_score = -5
+    a.extend_gap_score = -2
+    a.wildcard = "N"
+    if mode == "global":  # free end gaps -> overlap alignment
+        a.end_gap_score = 0.0
+    return a
+
+
+_OVERLAP = _make_aligner("global")
+_LOCAL = _make_aligner("local")
+
+
+def _columns(aln):
+    """Alignment -> list of (target_idx|None, query_idx|None) per column."""
+    c = aln.coordinates
+    cols = []
+    for k in range(c.shape[1] - 1):
+        a0, a1 = int(c[0][k]), int(c[0][k + 1])
+        b0, b1 = int(c[1][k]), int(c[1][k + 1])
+        da, db = a1 - a0, b1 - b0
+        if da == db:
+            cols += [(a0 + i, b0 + i) for i in range(da)]
+        elif db == 0:
+            cols += [(a0 + i, None) for i in range(da)]
+        elif da == 0:
+            cols += [(None, b0 + i) for i in range(db)]
+    return cols
+
+
+# ---------------------------------------------------------------------------
+# Consensus from two reads
+# ---------------------------------------------------------------------------
+def merge_reads(fseq, fq, fidx, rseq, rq, ridx, min_q=10, margin=10):
     """
-    Convert a single .ab1 chromatogram file to a SeqRecord with quality scores.
-    Matches the 'ab1 to FASTQ converter'.
-    Reads PHRD quality scores directly from the AB1 file.
+    Merge forward read and (already reverse-complemented) reverse read.
+    fidx / ridx map each base back to its 0-based position in the original AB1.
+    Returns None if the reads cannot be aligned at all, otherwise a dict.
     """
-    record = SeqIO.read(ab1_path, "abi")
+    aln = _OVERLAP.align(fseq, rseq)[0]
+    cols = _columns(aln)
+    paired = [k for k, (a, b) in enumerate(cols) if a is not None and b is not None]
+    if not paired:
+        return {"ok": False, "overlap_len": 0, "identity": 0.0}
 
-    # Try to read quality scores directly from PHRD tag
-    phrd_quals = read_ab1_quality(ab1_path)
+    first, last = paired[0], paired[-1]
+    matches = sum(1 for k in paired if _compatible(fseq[cols[k][0]], rseq[cols[k][1]]))
+    identity = matches / len(paired)
+    overlap_len = last - first + 1
+    if len(paired) < 20 or identity < 0.8:
+        return {"ok": False, "overlap_len": overlap_len, "identity": identity}
 
-    if phrd_quals and len(phrd_quals) == len(record.seq):
-        # Use PHRD quality scores directly
-        record.letter_annotations["phred_quality"] = phrd_quals
-    elif not record.letter_annotations.get("phred_quality"):
-        # Fallback: use BioPython's extracted quality or default
-        # BioPython's quality extraction might differ
-        record.letter_annotations["phred_quality"] = [20] * len(record.seq)
+    cb, cq, src = [], [], []
+    frow, rrow, crow = [], [], []
+    disagreements, mism, indels = [], 0, 0
 
-    return record
+    for k, (a, b) in enumerate(cols):
+        fb = fseq[a] if a is not None else "-"
+        rb = rseq[b] if b is not None else "-"
+        frow.append(fb)
+        rrow.append(rb)
 
-
-def records_to_fastq_string(records: list, tag: str = "") -> str:
-    """Write a list of SeqRecords to FASTQ string format."""
-    lines = []
-    for rec in records:
-        quals = rec.letter_annotations.get("phred_quality", [20] * len(rec.seq))
-        qual_str = "".join(chr(q + 33) for q in quals)
-        lines.append(f"@{rec.id}")
-        lines.append(str(rec.seq))
-        lines.append("+")
-        lines.append(qual_str)
-    return "\n".join(lines) + "\n"
-
-
-def parse_fastq_string(fastq_str: str) -> list:
-    """Parse a FASTQ string into a list of SeqRecord objects."""
-    records = []
-    lines = fastq_str.strip().split("\n")
-    i = 0
-    while i < len(lines) - 3:
-        if lines[i].startswith("@"):
-            header = lines[i][1:].strip()
-            seq = lines[i + 1].strip()
-            # lines[i+2] should be "+"
-            qual_str = lines[i + 3].strip()
-            quals = [ord(c) - 33 for c in qual_str]
-            rec = SeqRecord(Seq(seq), id=header, description="")
-            rec.letter_annotations["phred_quality"] = quals
-            records.append(rec)
-            i += 4
-        else:
-            i += 1
-    return records
-
-
-# ===========================================================================
-# STEP 2 – Quality Trimming (seqtk trimfq)
-# ===========================================================================
-def trimfq_quality(records: list, q: float = 0.05) -> list:
-    """
-    Quality-based trimming using seqtk trimfq.
-    Falls back to a Python implementation if seqtk is not available.
-    """
-    import shutil
-    import tempfile
-    import io as _io
-
-    # Try to use real seqtk if available
-    if shutil.which("seqtk"):
-        # Write records to temp FASTQ
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".fastq", delete=False) as f:
-            SeqIO.write(records, f, "fastq")
-            input_file = f.name
-
-        output_file = input_file + ".trimmed"
-
-        try:
-            result = subprocess.run(
-                ["seqtk", "trimfq", "-q", str(q), input_file],
-                capture_output=True, text=True, timeout=60
-            )
-
-            if result.returncode != 0:
-                print(f"  WARNING: seqtk failed: {result.stderr.strip()}")
-                raise RuntimeError(result.stderr)
-
-            # Parse seqtk output
-            trimmed = list(SeqIO.parse(_io.StringIO(result.stdout), "fastq"))
-            if not trimmed:
-                raise RuntimeError("seqtk produced no output")
-
-            return trimmed
-
-        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-            print(f"  WARNING: seqtk not available ({e}), falling back to Python implementation")
-        finally:
-            if os.path.exists(input_file):
-                os.unlink(input_file)
-            if os.path.exists(output_file):
-                os.unlink(output_file)
-
-    # Fallback: Python implementation
-    trimmed = []
-    for rec in records:
-        quals = list(rec.letter_annotations.get("phred_quality", [20] * len(rec.seq)))
-        seq = str(rec.seq)
-        n = len(quals)
-
-        if n == 0:
-            trimmed.append(rec)
-            continue
-
-        qual_threshold = -10 * math.log10(q) if q > 0 else 20
-        window_size = max(1, n // 5)
-
-        left_trim = 0
-        for i in range(n - window_size + 1):
-            window_mean = sum(quals[i:i + window_size]) / window_size
-            if window_mean >= qual_threshold:
-                left_trim = i
-                break
-
-        right_trim = n
-        for i in range(n - 1, window_size - 1, -1):
-            window_mean = sum(quals[i - window_size + 1:i + 1]) / window_size
-            if window_mean >= qual_threshold:
-                right_trim = i + 1
-                break
-
-        for i in range(left_trim, right_trim):
-            if quals[i] >= qual_threshold:
-                left_trim = i
-                break
-
-        for i in range(right_trim - 1, left_trim - 1, -1):
-            if quals[i] >= qual_threshold:
-                right_trim = i + 1
-                break
-
-        min_len = min(50, n)
-        if right_trim - left_trim < min_len and n >= min_len:
-            left_trim = 0
-            right_trim = min_len
-
-        new_seq = Seq(seq[left_trim:right_trim])
-        new_quals = quals[left_trim:right_trim]
-        new_rec = SeqRecord(new_seq, id=rec.id, description="")
-        new_rec.letter_annotations["phred_quality"] = new_quals
-        trimmed.append(new_rec)
-
-    return trimmed
-
-
-# ===========================================================================
-# STEP 3 – Sort Collection (alphabetical)
-# ===========================================================================
-def sort_records_alpha(records: list) -> list:
-    """Sort SeqRecords alphabetically by ID."""
-    return sorted(records, key=lambda r: r.id)
-
-
-# ===========================================================================
-# STEP 4 – FASTQ Groomer (ensure fastqsanger encoding)
-# ===========================================================================
-def fastq_groomer(records: list) -> list:
-    """
-    Ensures quality values are in Sanger (Phred+33) encoding
-    and fixes IDs to match the sequence.
-    """
-    groomed = []
-    for rec in records:
-        quals = list(rec.letter_annotations.get("phred_quality", [20] * len(rec.seq)))
-        # Clamp to 0-93 range for Sanger encoding
-        quals = [max(0, min(93, q)) for q in quals]
-        new_rec = SeqRecord(Seq(str(rec.seq)), id=rec.id, description="")
-        new_rec.letter_annotations["phred_quality"] = quals
-        groomed.append(new_rec)
-    return groomed
-
-
-# ===========================================================================
-# STEP 5 – Reverse Complement
-# ===========================================================================
-def reverse_complement_records(records: list) -> list:
-    """Reverse complement each SeqRecord – equivalent to FASTX Reverse-Complement."""
-    rc_records = []
-    for rec in records:
-        rc_seq = rec.seq.reverse_complement()
-        quals = list(rec.letter_annotations.get("phred_quality", []))
-        quals.reverse()  # Reverse quality scores too
-        new_rec = SeqRecord(rc_seq, id=rec.id, description="")
-        if quals:
-            new_rec.letter_annotations["phred_quality"] = quals
-        rc_records.append(new_rec)
-    return rc_records
-
-
-# ===========================================================================
-# STEP 6 – Merge Paired-End (interleaved FASTQ)
-# ===========================================================================
-def mergepe_interleaved(forward_records: list, reverse_records: list) -> list:
-    """
-    Merge forward and reverse into interleaved FASTQ.
-    Equivalent to seqtk mergepe.
-    Forward and reverse collections must be sorted the same way.
-    """
-    merged = []
-    for fwd, rev in zip(forward_records, reverse_records):
-        merged.append(fwd)
-        merged.append(rev)
-    return merged
-
-
-# ===========================================================================
-# STEP 7 – FASTQ to Tabular
-# ===========================================================================
-def fastq_to_tabular(records: list) -> str:
-    """
-    Convert FASTQ to tabular format.
-    Columns: sequence identifier, sequence
-    Equivalent to fastq_to_tabular.
-    """
-    lines = []
-    for rec in records:
-        # Description columns = 1 (from workflow: descr_columns="1")
-        lines.append(f"{rec.id}\t{str(rec.seq)}")
-    return "\n".join(lines) + "\n"
-
-
-# ===========================================================================
-# STEP 8 – Tabular to FASTA
-# ===========================================================================
-def tabular_to_fasta(tabular_str: str) -> list:
-    """
-    Convert tabular to FASTA.
-    seq_col=2 (sequence), title_col=1 (identifier)
-    Equivalent to tabular_to_fasta.
-    """
-    records = []
-    for line in tabular_str.strip().split("\n"):
-        if not line.strip():
-            continue
-        parts = line.split("\t")
-        if len(parts) >= 2:
-            header = parts[0].strip()
-            seq = parts[1].strip()
-            rec = SeqRecord(Seq(seq), id=header, description="")
-            records.append(rec)
-    return records
-
-
-# ===========================================================================
-# STEP 9 – MAFFT Alignment
-# ===========================================================================
-def mafft_align(records: list, method: str = "auto") -> tuple:
-    """
-    Run MAFFT alignment on a list of SeqRecords.
-    Returns (aligned_records, log_string).
-    """
-    # Write sequences to temp file
-    import tempfile
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".fasta", delete=False) as f:
-        SeqIO.write(records, f, "fasta")
-        input_file = f.name
-
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".fasta", delete=False) as f:
-        output_file = f.name
-
-    try:
-        # Run MAFFT
-        result = subprocess.run(
-            ["mafft", "--auto", input_file],
-            capture_output=True,
-            text=True,
-            timeout=300
-        )
-        aligned_str = result.stdout
-        log_str = result.stderr
-
-        # Parse aligned sequences
-        import io
-        aligned_records = list(SeqIO.parse(io.StringIO(aligned_str), "fasta"))
-
-        return aligned_records, log_str
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("MAFFT alignment timed out after 300 seconds")
-    except FileNotFoundError:
-        raise RuntimeError("MAFFT not found. Please install MAFFT: conda install -c bioconda mafft")
-    finally:
-        os.unlink(input_file)
-        if os.path.exists(output_file):
-            os.unlink(output_file)
-
-
-# ===========================================================================
-# STEP 10 – Consensus from Aligned FASTA (chr_ambiguity method)
-# ===========================================================================
-def aligned_to_consensus(aligned_records: list, aligned_with_quals: list = None, sample_name: str = "consensus") -> SeqRecord:
-    """
-    Build consensus from aligned FASTA.
-    method=chr_ambiguity, gaps=false, seqtype=DNA
-
-    Algorithm:
-    1. For each alignment column, collect non-gap bases + their quality scores
-    2. Expand IUPAC ambiguity codes to constituent bases (e.g. Y→C/T)
-    3. Weight each base call by its Phred quality score
-    4. The base with the highest total quality weight wins
-    5. Skip columns where all sequences have gaps
-    """
-    if not aligned_records:
-        raise ValueError("No sequences to build consensus from")
-
-    max_len = max(len(r.seq) for r in aligned_records)
-    n_seqs = len(aligned_records)
-    use_quality = aligned_with_quals is not None and len(aligned_with_quals) == n_seqs
-
-    raw_consensus = []
-    raw_coverage = []
-
-    for i in range(max_len):
-        base_weights = {}
-        nongap_count = 0
-
-        for idx, rec in enumerate(aligned_records):
-            if i >= len(rec.seq):
-                continue
-            base = str(rec.seq[i]).upper()
-            if base in ("-", "."):
-                continue
-
-            nongap_count += 1
-
-            if use_quality and idx < len(aligned_with_quals):
-                quals = aligned_with_quals[idx]
-                weight = max(quals[i], 1) if i < len(quals) else 10
+        if a is not None and b is not None:
+            q1, q2 = fq[a], rq[b]
+            inter = set(_expand(fb)) & set(_expand(rb))
+            if fb == rb:
+                base, q, s = fb, min(q1 + q2, 60), "both"
+            elif fb == "N":
+                base, q, s = rb, q2, "R"
+            elif rb == "N":
+                base, q, s = fb, q1, "F"
+            elif len(inter) == 1:
+                base, q, s = next(iter(inter)), min(q1 + q2, 60), "both"
             else:
-                weight = 10
-
-            # Expand IUPAC ambiguity codes before voting
-            if base in IUPAC_EXPANSION:
-                for eb in IUPAC_EXPANSION[base]:
-                    base_weights[eb] = base_weights.get(eb, 0) + weight
-            else:
-                base_weights[base] = base_weights.get(base, 0) + weight
-
-        raw_coverage.append(nongap_count)
-
-        if not base_weights:
-            raw_consensus.append("N")
-            continue
-
-        best_base = max(base_weights, key=base_weights.get)
-        raw_consensus.append(best_base)
-
-    consensus_seq = Seq("".join(raw_consensus))
-    return SeqRecord(consensus_seq, id=sample_name, description="")
-
-
-# ===========================================================================
-# STEP 11 – Regex Find And Replace (format FASTA headers)
-# ===========================================================================
-def regex_find_replace_fasta(fasta_str: str) -> str:
-    """
-    Regex find and replace on FASTA file.
-    Pattern: ([A-Z-])>  →  \1\n>
-    This ensures there's a newline before the '>' header when the previous
-    line ends with a base character, effectively formatting multi-line FASTA
-    into one-sequence-per-line format.
-    """
-    result = re.sub(r"([A-Z\-])>", r"\1\n>", fasta_str)
-    return result
-
-
-# ===========================================================================
-# MAIN WORKFLOW
-# ===========================================================================
-def run_workflow(forward_dir, reverse_dir, output_dir, trim_quality=0.05, sample_name=None):
-    """
-    Run the Sanger sequencing workflow.
-
-    Returns (returncode, output_string).
-    """
-    import io
-    import contextlib
-
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        try:
-            os.makedirs(output_dir, exist_ok=True)
-            work = output_dir
-
-            print("=" * 70)
-            print("SANGER SEQUENCING WORKFLOW")
-            print("Python Sanger Sequencing Data Analysis")
-            print("=" * 70)
-
-            print("\n[Step 1] Reading AB1 files and converting to FASTQ...")
-            forward_ab1_files = sorted(glob.glob(os.path.join(forward_dir, "*.ab1")))
-            reverse_ab1_files = sorted(glob.glob(os.path.join(reverse_dir, "*.ab1")))
-
-            if not forward_ab1_files:
-                print(f"ERROR: No .ab1 files found in {forward_dir}/")
-                return 1, buf.getvalue()
-            if not reverse_ab1_files:
-                print(f"ERROR: No .ab1 files found in {reverse_dir}/")
-                return 1, buf.getvalue()
-
-            print(f"  Forward files: {len(forward_ab1_files)}")
-            print(f"  Reverse files: {len(reverse_ab1_files)}")
-
-            forward_records_raw = [ab1_to_fastq(f) for f in forward_ab1_files]
-            reverse_records_raw = [ab1_to_fastq(f) for f in reverse_ab1_files]
-
-            with open(os.path.join(work, "forward_raw.fastq"), "w") as f:
-                f.write(records_to_fastq_string(forward_records_raw))
-            with open(os.path.join(work, "reverse_raw.fastq"), "w") as f:
-                f.write(records_to_fastq_string(reverse_records_raw))
-
-            print(f"  → forward_raw.fastq ({len(forward_records_raw)} sequences)")
-            print(f"  → reverse_raw.fastq ({len(reverse_records_raw)} sequences)")
-
-            print(f"\n[Step 2] Quality trimming (q={trim_quality}, Phred≥{int(-10*math.log10(trim_quality))})...")
-            forward_trimmed = trimfq_quality(forward_records_raw, q=trim_quality)
-            reverse_trimmed = trimfq_quality(reverse_records_raw, q=trim_quality)
-
-            print(f"  Forward: {len(forward_records_raw[0].seq)} → {len(forward_trimmed[0].seq)} bases (avg)")
-            print(f"  Reverse: {len(reverse_records_raw[0].seq)} → {len(reverse_trimmed[0].seq)} bases (avg)")
-
-            with open(os.path.join(work, "forward_trimmed.fastq"), "w") as f:
-                f.write(records_to_fastq_string(forward_trimmed))
-            with open(os.path.join(work, "reverse_trimmed.fastq"), "w") as f:
-                f.write(records_to_fastq_string(reverse_trimmed))
-
-            print("\n[Step 3] Sorting collections alphabetically...")
-            forward_sorted = sort_records_alpha(forward_trimmed)
-            reverse_sorted = sort_records_alpha(reverse_trimmed)
-
-            print(f"  Forward order: {[r.id for r in forward_sorted]}")
-            print(f"  Reverse order: {[r.id for r in reverse_sorted]}")
-
-            print("\n[Step 4] FASTQ Groomer (ensuring Sanger encoding)...")
-            reverse_groomed = fastq_groomer(reverse_sorted)
-
-            with open(os.path.join(work, "reverse_groomed.fastq"), "w") as f:
-                f.write(records_to_fastq_string(reverse_groomed))
-
-            print("\n[Step 5] Reverse Complementing reverse reads...")
-            reverse_rc = reverse_complement_records(reverse_groomed)
-
-            with open(os.path.join(work, "reverse_complement.fastq"), "w") as f:
-                f.write(records_to_fastq_string(reverse_rc))
-
-            print(f"  RC first seq: {str(reverse_rc[0].seq[:50])}...")
-
-            print("\n[Step 6] Sorting reversed collection alphabetically...")
-            reverse_rc_sorted = sort_records_alpha(reverse_rc)
-
-            print("\n[Step 7] Merging paired-end reads (interleaved)...")
-            merged = mergepe_interleaved(forward_sorted, reverse_rc_sorted)
-
-            with open(os.path.join(work, "merged_interleaved.fastq"), "w") as f:
-                f.write(records_to_fastq_string(merged))
-
-            print(f"  Merged {len(merged)} records ({len(merged)//2} pairs)")
-
-            print("\n[Step 8] FASTQ Groomer (post-merge encoding fix)...")
-            merged_groomed = fastq_groomer(merged)
-
-            with open(os.path.join(work, "merged_groomed.fastq"), "w") as f:
-                f.write(records_to_fastq_string(merged_groomed))
-
-            print("\n[Step 9] FASTQ to Tabular conversion...")
-            tabular = fastq_to_tabular(merged_groomed)
-
-            with open(os.path.join(work, "merged.tabular"), "w") as f:
-                f.write(tabular)
-
-            tab_lines = tabular.strip().split("\n")
-            print(f"  {len(tab_lines)} tabular records created")
-
-            print("\n[Step 10] Tabular to FASTA conversion...")
-            fasta_records = tabular_to_fasta(tabular)
-
-            with open(os.path.join(work, "merged.fasta"), "w") as f:
-                SeqIO.write(fasta_records, f, "fasta")
-
-            print(f"  {len(fasta_records)} FASTA sequences created")
-
-            print("\n[Step 11] MAFFT alignment (first pass)...")
-            aligned_records_1, log1 = mafft_align(fasta_records)
-
-            with open(os.path.join(work, "aligned.fasta"), "w") as f:
-                SeqIO.write(aligned_records_1, f, "fasta")
-            with open(os.path.join(work, "alignment_log_1.txt"), "w") as f:
-                f.write(log1)
-
-            print(f"  Aligned {len(aligned_records_1)} sequences")
-            print(f"  Alignment length: {len(aligned_records_1[0].seq)} bp")
-
-            print("\n[Step 12] Building consensus sequence (quality-weighted chr_ambiguity)...")
-            aligned_quals = []
-            for rec in aligned_records_1:
-                quals = rec.letter_annotations.get("phred_quality", [])
-                if quals:
-                    aligned_quals.append(quals)
+                mism += 1
+                if q1 >= q2 + margin:
+                    base, q, s, res = fb, q1, "F", "forward"
+                elif q2 >= q1 + margin:
+                    base, q, s, res = rb, q2, "R", "reverse"
+                elif min(q1, q2) < min_q:
+                    base, q, s, res = (fb, q1, "F", "forward") if q1 >= q2 else (rb, q2, "R", "reverse")
                 else:
-                    aligned_quals.append([20] * len(rec.seq))
-
-            consensus_name = sample_name if sample_name else os.path.basename(os.path.abspath(work))
-            consensus = aligned_to_consensus(aligned_records_1, aligned_with_quals=aligned_quals, sample_name=consensus_name)
-
-            with open(os.path.join(work, "consensus.fasta"), "w") as f:
-                SeqIO.write([consensus], f, "fasta")
-
-            print(f"  Consensus length: {len(consensus.seq)} bp")
-            print(f"  First 80 bp: {str(consensus.seq[:80])}")
-
-            print("\n[Step 13] Merge.files (combining consensus + aligned sequences)...")
-            all_sequences = aligned_records_1 + [consensus]
-
-            with open(os.path.join(work, "all_sequences.fasta"), "w") as f:
-                SeqIO.write(all_sequences, f, "fasta")
-
-            print(f"  Total sequences: {len(all_sequences)} ({len(aligned_records_1)} aligned + 1 consensus)")
-
-            print("\n[Step 14] Regex Find And Replace (formatting FASTA headers)...")
-            fasta_str = ""
-            for rec in all_sequences:
-                fasta_str += f">{rec.id}\n{str(rec.seq)}\n"
-
-            formatted_fasta = regex_find_replace_fasta(fasta_str)
-
-            with open(os.path.join(work, "formatted_sequences.fasta"), "w") as f:
-                f.write(formatted_fasta)
-
-            print("\n[Step 15] MAFFT alignment (final pass on formatted sequences)...")
-            formatted_records = list(SeqIO.parse(io.StringIO(formatted_fasta), "fasta"))
-
-            aligned_records_final, log2 = mafft_align(formatted_records)
-
-            with open(os.path.join(work, "final_aligned.fasta"), "w") as f:
-                SeqIO.write(aligned_records_final, f, "fasta")
-            with open(os.path.join(work, "alignment_log_2.txt"), "w") as f:
-                f.write(log2)
-
-            print(f"  Final alignment: {len(aligned_records_final)} sequences, {len(aligned_records_final[0].seq)} bp")
-
-            print("\n[Step 16] Computing quality statistics...")
-            consensus_seq = str(consensus.seq).upper()
-            consensus_len = len(consensus_seq)
-
-            base_counts = Counter(consensus_seq)
-            valid_bases = sum(base_counts[b] for b in "ATCG")
-            ambiguous_bases = sum(base_counts[b] for b in "RYSWKMBDHVN")
-            n_bases = base_counts.get("N", 0)
-            gap_bases = base_counts.get("-", 0) + base_counts.get(".", 0)
-
-            gc_count = base_counts.get("G", 0) + base_counts.get("C", 0)
-            gc_content = (gc_count / valid_bases * 100) if valid_bases > 0 else 0.0
-            ambiguity_pct = (ambiguous_bases / consensus_len * 100) if consensus_len > 0 else 0.0
-            n_pct = (n_bases / consensus_len * 100) if consensus_len > 0 else 0.0
-            gap_pct = (gap_bases / consensus_len * 100) if consensus_len > 0 else 0.0
-            coverage_pct = (valid_bases / consensus_len * 100) if consensus_len > 0 else 0.0
-
-            all_fwd_quals = []
-            for rec in forward_records_raw:
-                all_fwd_quals.extend(rec.letter_annotations.get("phred_quality", []))
-            all_rev_quals = []
-            for rec in reverse_records_raw:
-                all_rev_quals.extend(rec.letter_annotations.get("phred_quality", []))
-
-            fwd_avg_qual = sum(all_fwd_quals) / len(all_fwd_quals) if all_fwd_quals else 0
-            rev_avg_qual = sum(all_rev_quals) / len(all_rev_quals) if all_rev_quals else 0
-            fwd_min_qual = min(all_fwd_quals) if all_fwd_quals else 0
-            rev_min_qual = min(all_rev_quals) if all_rev_quals else 0
-
-            if ambiguity_pct < 1 and n_pct < 1:
-                quality_rating = "Excellent"
-            elif ambiguity_pct < 3 and n_pct < 3:
-                quality_rating = "Good"
-            elif ambiguity_pct < 5 and n_pct < 5:
-                quality_rating = "Fair"
+                    union = frozenset(set(_expand(fb)) | set(_expand(rb)))
+                    base, q, s, res = IUPAC_CODE.get(union, "N"), min(q1, q2), "conflict", "IUPAC"
+                disagreements.append({
+                    "consensus_pos": len(cb) + 1, "call": base, "resolution": res,
+                    "forward_pos": fidx[a] + 1, "forward_base": fb, "forward_q": q1,
+                    "reverse_pos": ridx[b] + 1, "reverse_base": rb, "reverse_q": q2,
+                })
+        elif k < first or k > last:           # single-read overhang
+            if a is not None:
+                base, q, s = fb, fq[a], "F"
             else:
-                quality_rating = "Poor"
+                base, q, s = rb, rq[b], "R"
+        else:                                  # indel inside the overlap
+            indels += 1
+            if a is not None:
+                base, q, s = fb, fq[a], "F"
+            else:
+                base, q, s = rb, rq[b], "R"
+            if q < 20:                         # unreliable insertion -> drop
+                crow.append("-")
+                continue
 
-            stats = {
-                "sample_name": consensus_name,
-                "forward_file": os.path.basename(forward_ab1_files[0]) if forward_ab1_files else "",
-                "reverse_file": os.path.basename(reverse_ab1_files[0]) if reverse_ab1_files else "",
-                "forward_raw_length": len(forward_records_raw[0].seq) if forward_records_raw else 0,
-                "reverse_raw_length": len(reverse_records_raw[0].seq) if reverse_records_raw else 0,
-                "forward_trimmed_length": len(forward_trimmed[0].seq) if forward_trimmed else 0,
-                "reverse_trimmed_length": len(reverse_trimmed[0].seq) if reverse_trimmed else 0,
-                "alignment_length": len(aligned_records_1[0].seq) if aligned_records_1 else 0,
-                "consensus_length": consensus_len,
-                "valid_bases": valid_bases,
-                "ambiguous_bases": ambiguous_bases,
-                "n_bases": n_bases,
-                "gap_bases": gap_bases,
-                "gc_content": round(gc_content, 2),
-                "ambiguity_pct": round(ambiguity_pct, 2),
-                "n_pct": round(n_pct, 2),
-                "gap_pct": round(gap_pct, 2),
-                "coverage_pct": round(coverage_pct, 2),
-                "forward_avg_quality": round(fwd_avg_qual, 1),
-                "reverse_avg_quality": round(rev_avg_qual, 1),
-                "forward_min_quality": fwd_min_qual,
-                "reverse_min_quality": rev_min_qual,
-                "quality_rating": quality_rating,
-                "num_sequences_aligned": len(aligned_records_1),
-            }
+        if q < min_q:
+            base = "N"
+        cb.append(base)
+        cq.append(q)
+        src.append(s)
+        crow.append(base)
 
-            stats_path = os.path.join(work, "sample_stats.json")
-            with open(stats_path, "w") as f:
-                json.dump(stats, f, indent=2)
-
-            print(f"  Quality rating: {quality_rating}")
-            print(f"  Consensus: {consensus_len} bp, GC: {gc_content:.1f}%, Ambiguity: {ambiguity_pct:.1f}%")
-            print(f"  → sample_stats.json")
-
-            print("\n" + "=" * 70)
-            print("WORKFLOW COMPLETE!")
-            print("=" * 70)
-            print(f"\nOutput directory: {os.path.abspath(work)}/")
-            print("\nFiles produced:")
-            for fname in sorted(os.listdir(work)):
-                fpath = os.path.join(work, fname)
-                size = os.path.getsize(fpath)
-                print(f"  {fname:40s} ({size:,} bytes)")
-
-            print("\n" + "=" * 70)
-            print("WORKFLOW STEP SUMMARY:")
-            print("=" * 70)
-            print(f"  {'Step':12s} | {'Tool':30s} | {'Output'}")
-            print(f"  {'-'*12}-+-{'-'*30}-+-{'-'*30}")
-            steps = [
-                ("Steps 1-2", "AB1 to FASTQ", "forward_raw.fastq, reverse_raw.fastq"),
-                ("Step 3", "Quality trimming", "forward_trimmed.fastq, reverse_trimmed.fastq"),
-                ("Step 4", "Sort collection", "sorted in memory"),
-                ("Step 5", "FASTQ Groomer", "reverse_groomed.fastq"),
-                ("Step 6", "Reverse-Complement", "reverse_complement.fastq"),
-                ("Step 7", "Sort collection", "sorted in memory"),
-                ("Step 8", "Merge paired-end", "merged_interleaved.fastq"),
-                ("Step 9", "FASTQ Groomer", "merged_groomed.fastq"),
-                ("Step 10", "FASTQ to Tabular", "merged.tabular"),
-                ("Step 11", "Tabular-to-FASTA", "merged.fasta"),
-                ("Step 12", "MAFFT alignment", "aligned.fasta"),
-                ("Step 13", "Consensus", "consensus.fasta"),
-                ("Steps 14-15", "Merge files", "all_sequences.fasta"),
-                ("Step 16", "Regex format", "formatted_sequences.fasta"),
-                ("Step 17", "MAFFT alignment", "final_aligned.fasta"),
-            ]
-            for step, tool, output in steps:
-                print(f"  {step:12s} | {tool:30s} | {output}")
-
-            print("\nDone!")
-            return 0, buf.getvalue()
-
-        except Exception as e:
-            import traceback
-            print(f"ERROR: {e}")
-            traceback.print_exc()
-            return 1, buf.getvalue()
+    return {
+        "ok": True, "seq": "".join(cb), "quals": cq, "src": src,
+        "rows": ("".join(frow), "".join(rrow), "".join(crow)),
+        "overlap_len": overlap_len, "identity": identity,
+        "disagreements": disagreements, "mismatches": mism, "indels": indels,
+        "alignment_length": len(cols),
+    }
 
 
+# ---------------------------------------------------------------------------
+# Reference comparison (mutation calling)
+# ---------------------------------------------------------------------------
+def parse_reference(text):
+    """Accept FASTA or a raw sequence. Returns (name, seq) or None if empty."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    name, lines = "reference", []
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith(">"):
+            if lines:
+                break
+            if line[1:].strip():
+                name = line[1:].split()[0]
+        elif line:
+            lines.append(line)
+    seq = re.sub(r"[^A-Za-z]", "", "".join(lines)).upper().replace("U", "T")
+    if len(seq) < 20 or sum(c in "ACGTN" for c in seq) / len(seq) < 0.9:
+        raise ValueError("needs at least 20 nucleotides (A, C, G, T)")
+    return name, seq
+
+
+def compare_to_reference(cons: str, quals, ref_name: str, ref: str) -> dict:
+    """Local-align consensus to the reference (both strands) and list variants."""
+    n = len(cons)
+    best = None
+    for strand, s in (("+", cons), ("-", revcomp(cons))):
+        aln = _LOCAL.align(ref, s)[0]
+        if best is None or aln.score > best[0].score:
+            best = (aln, strand)
+    aln, strand = best
+    cols = _columns(aln)
+    r0 = int(aln.coordinates[0][0])   # coordinates are already absolute indices
+    qry = cons if strand == "+" else revcomp(cons)
+
+    def cons_pos(j):       # 0-based index in the query -> 1-based consensus position
+        return j + 1 if strand == "+" else n - j
+
+    def qual(j):
+        return quals[j if strand == "+" else n - 1 - j]
+
+    variants, matches, aligned = [], 0, 0
+    i = 0
+    while i < len(cols):
+        a, b = cols[i]
+        if a is not None and b is not None:
+            aligned += 1
+            rb, qb = ref[a], qry[b]
+            if rb == qb or (qb in AMBIGUOUS and rb in _expand(qb)):
+                matches += 1 if rb == qb else 0
+            elif qb == "N":
+                pass
+            else:
+                kind = "AMBIGUOUS" if qb in AMBIGUOUS else "SNP"
+                variants.append({"type": kind, "ref_pos": a + 1, "ref": rb, "alt": qb,
+                                 "consensus_pos": cons_pos(b), "quality": qual(b),
+                                 "change": f"{rb}{a + 1}{qb}"})
+            i += 1
+        else:
+            j = i
+            while j < len(cols) and ((a is None) == (cols[j][0] is None)) and ((b is None) == (cols[j][1] is None)):
+                j += 1
+            run = cols[i:j]
+            if a is None:   # insertion in sample
+                bases = "".join(qry[x[1]] for x in run)
+                p = next((c[0] for c in reversed(cols[:i]) if c[0] is not None), r0 - 1)
+                variants.append({"type": "INS", "ref_pos": p + 1, "ref": "-", "alt": bases,
+                                 "consensus_pos": cons_pos(run[0][1]),
+                                 "quality": min(qual(x[1]) for x in run),
+                                 "change": f"ins {bases} after {p + 1}"})
+            else:           # deletion in sample
+                bases = "".join(ref[x[0]] for x in run)
+                p = run[0][0]
+                nb = next((c[1] for c in cols[i:] if c[1] is not None), None)
+                variants.append({"type": "DEL", "ref_pos": p + 1, "ref": bases, "alt": "-",
+                                 "consensus_pos": cons_pos(nb) if nb is not None else 0,
+                                 "quality": qual(nb) if nb is not None else 0,
+                                 "change": f"del {bases} at {p + 1}"})
+            i = j
+
+    ref_cols = [c[0] for c in cols if c[0] is not None]
+    ref_start, ref_end = (min(ref_cols) + 1, max(ref_cols) + 1) if ref_cols else (0, 0)
+    return {
+        "reference_name": ref_name, "reference_length": len(ref), "strand": strand,
+        "identity": round(100 * matches / aligned, 2) if aligned else 0.0,
+        "ref_start": ref_start, "ref_end": ref_end,
+        "ref_coverage_pct": round(100 * (ref_end - ref_start + 1) / len(ref), 1) if ref_cols else 0.0,
+        "variants": variants,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Rating + outputs
+# ---------------------------------------------------------------------------
+def rate(amb_pct, n_pct, q20_pct):
+    if amb_pct < 1 and n_pct < 1 and q20_pct >= 90:
+        return "Excellent"
+    if amb_pct < 3 and n_pct < 3 and q20_pct >= 75:
+        return "Good"
+    if amb_pct < 5 and n_pct < 5 and q20_pct >= 50:
+        return "Fair"
+    return "Poor"
+
+
+def _write_fastq(path, name, seq, quals):
+    with open(path, "w") as f:
+        f.write(f"@{name}\n{seq}\n+\n{''.join(chr(min(q, 93) + 33) for q in quals)}\n")
+
+
+def _mean(x):
+    return sum(x) / len(x) if x else 0.0
+
+
+# ---------------------------------------------------------------------------
+# Main per-sample entry point
+# ---------------------------------------------------------------------------
+def run_sample(sample, forward, reverse, out_dir, trim_quality=0.05,
+               reference=None, min_base_q=10):
+    """
+    Process one sample. `forward` / `reverse` are AB1 paths (either may be None).
+    `reference` is (name, seq) or None. Returns the stats dict (also saved as
+    sample_stats.json). Raises ValueError if no usable read is available.
+    """
+    t0 = time.perf_counter()
+    if not forward and not reverse:
+        raise ValueError("No AB1 file given")
+    os.makedirs(os.path.join(out_dir, "ab1"), exist_ok=True)
+    warnings, reads = [], {}
+
+    for key, path in (("forward", forward), ("reverse", reverse)):
+        if not path:
+            continue
+        shutil.copy2(path, os.path.join(out_dir, "ab1", os.path.basename(path)))
+        raw = read_ab1(path)
+        if raw["quality_missing"]:
+            warnings.append(f"{key}: no quality scores in file, assumed Q20")
+        s, e = mott_trim(raw["quals"], trim_quality)
+        if e - s < 20:
+            warnings.append(f"{key}: read is too short/poor after trimming ({e - s} bp) - ignored")
+            reads[key] = {"file": os.path.basename(path), "raw": raw, "trim": (s, e), "usable": False}
+            continue
+        seq, quals = raw["seq"][s:e], raw["quals"][s:e]
+        idx = list(range(s, e))
+        if key == "reverse":
+            seq, quals, idx = revcomp(seq), quals[::-1], idx[::-1]
+        reads[key] = {"file": os.path.basename(path), "raw": raw, "trim": (s, e), "usable": True,
+                      "seq": seq, "quals": quals, "idx": idx}
+        _write_fastq(os.path.join(out_dir, f"{key}_trimmed.fastq"), f"{sample}_{key}",
+                     raw["seq"][s:e], raw["quals"][s:e])
+
+    usable = [k for k in ("forward", "reverse") if reads.get(k, {}).get("usable")]
+    if not usable:
+        raise ValueError("; ".join(warnings) or "No usable reads")
+
+    merged, mode, disagreements = None, "", []
+    overlap_len, identity, mism, indels, aln_len = 0, 0.0, 0, 0, 0
+    if len(usable) == 2:
+        f, r = reads["forward"], reads["reverse"]
+        merged = merge_reads(f["seq"], f["quals"], f["idx"], r["seq"], r["quals"], r["idx"], min_base_q)
+        overlap_len, identity = merged["overlap_len"], merged["identity"]
+        if merged["ok"]:
+            mode = "paired"
+            cons, cq, src = merged["seq"], merged["quals"], merged["src"]
+            disagreements, mism, indels = merged["disagreements"], merged["mismatches"], merged["indels"]
+            aln_len = merged["alignment_length"]
+            with open(os.path.join(out_dir, "alignment.fasta"), "w") as fh:
+                for name, row in zip((f"{sample}_forward", f"{sample}_reverse_rc", f"{sample}_consensus"), merged["rows"]):
+                    fh.write(f">{name}\n{row}\n")
+        else:
+            warnings.append(
+                f"Forward and reverse reads do not overlap well (overlap {overlap_len} bp, "
+                f"identity {identity * 100:.0f}%). Check that they belong to the same sample/amplicon. "
+                "Using the better single read instead.")
+            usable = [max(usable, key=lambda k: len(reads[k]["seq"]) * _mean(reads[k]["quals"]))]
+            mode = "fallback_single"
+    if len(usable) == 1:
+        only = reads[usable[0]]
+        cons = only["seq"]
+        cq = list(only["quals"])
+        cons = "".join(b if q >= min_base_q else "N" for b, q in zip(cons, cq))
+        src = ["F" if usable[0] == "forward" else "R"] * len(cons)
+        mode = mode or f"{usable[0]}_only"
+        aln_len = len(cons)
+
+    # ---- statistics ----
+    L = len(cons)
+    counts = Counter(cons)
+    valid = sum(counts[b] for b in "ACGT")
+    amb = sum(counts[b] for b in "RYSWKMBDHV")
+    n_b = counts["N"]
+    amb_pct = amb / L * 100 if L else 0.0
+    n_pct = n_b / L * 100 if L else 0.0
+    q20_pct = sum(q >= 20 for q in cq) / L * 100 if L else 0.0
+    gc = (counts["G"] + counts["C"]) / valid * 100 if valid else 0.0
+
+    def info(key):
+        r = reads.get(key)
+        if not r:
+            return {"file": "", "raw": 0, "trim": [0, 0], "trimmed": 0, "avg": 0.0}
+        return {"file": r["file"], "raw": len(r["raw"]["seq"]), "trim": list(r["trim"]),
+                "trimmed": r["trim"][1] - r["trim"][0], "avg": round(_mean(r["raw"]["quals"]), 1)}
+
+    fi, ri = info("forward"), info("reverse")
+    stats = {
+        "sample_name": sample, "mode": mode,
+        "forward_file": fi["file"], "reverse_file": ri["file"],
+        "forward_raw_length": fi["raw"], "reverse_raw_length": ri["raw"],
+        "forward_trimmed_length": fi["trimmed"], "reverse_trimmed_length": ri["trimmed"],
+        "forward_trim": fi["trim"], "reverse_trim": ri["trim"],
+        "forward_avg_quality": fi["avg"], "reverse_avg_quality": ri["avg"],
+        "alignment_length": aln_len, "consensus_length": L,
+        "valid_bases": valid, "ambiguous_bases": amb, "n_bases": n_b,
+        "gc_content": round(gc, 2), "ambiguity_pct": round(amb_pct, 2), "n_pct": round(n_pct, 2),
+        "coverage_pct": round(valid / L * 100, 2) if L else 0.0,
+        "q20_pct": round(q20_pct, 1), "mean_consensus_quality": round(_mean(cq), 1),
+        "overlap_length": overlap_len, "overlap_identity": round(identity * 100, 1),
+        "mismatches": mism, "indels": indels, "disagreements": disagreements,
+        "num_sequences_aligned": len(usable),
+        "quality_rating": rate(amb_pct, n_pct, q20_pct),
+        "warnings": warnings, "reference": None,
+    }
+
+    # ---- files ----
+    with open(os.path.join(out_dir, "consensus.fasta"), "w") as fh:
+        fh.write(f">{sample}\n{cons}\n")
+    with open(os.path.join(out_dir, "consensus.tsv"), "w", newline="") as fh:
+        w = csv.writer(fh, delimiter="\t")
+        w.writerow(["position", "base", "quality", "source"])
+        for i, (b, q, s) in enumerate(zip(cons, cq, src), 1):
+            w.writerow([i, b, q, s])
+    if disagreements:
+        with open(os.path.join(out_dir, "disagreements.tsv"), "w", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=list(disagreements[0].keys()), delimiter="\t")
+            w.writeheader()
+            w.writerows(disagreements)
+
+    if reference:
+        cmp = compare_to_reference(cons, cq, *reference)
+        stats["reference"] = cmp
+        with open(os.path.join(out_dir, "variants.tsv"), "w", newline="") as fh:
+            w = csv.writer(fh, delimiter="\t")
+            w.writerow(["type", "ref_pos", "ref", "alt", "consensus_pos", "quality", "change"])
+            for v in cmp["variants"]:
+                w.writerow([v[k] for k in ("type", "ref_pos", "ref", "alt", "consensus_pos", "quality", "change")])
+
+    stats["consensus_quals"] = cq
+    stats["consensus_src"] = "".join(src)
+    stats["consensus_seq"] = cons
+    stats["elapsed_s"] = round(time.perf_counter() - t0, 2)
+    with open(os.path.join(out_dir, "sample_stats.json"), "w") as fh:
+        json.dump(stats, fh, indent=1)
+    return stats
+
+
+# ---------------------------------------------------------------------------
 def main():
-    parser = argparse.ArgumentParser(
-        description="Sanger Sequencing Workflow"
-    )
-    parser.add_argument(
-        "--forward", "-f",
-        default="F",
-        help="Directory containing forward AB1 files (default: F/)"
-    )
-    parser.add_argument(
-        "--reverse", "-r",
-        default="R",
-        help="Directory containing reverse AB1 files (default: R/)"
-    )
-    parser.add_argument(
-        "--output", "-o",
-        default="output",
-        help="Output directory (default: output/)"
-    )
-    parser.add_argument(
-        "--trim-quality", "-q",
-        type=float,
-        default=0.05,
-        help="Quality trimming threshold for seqtk trimfq (default: 0.05, ~Phred 13)"
-    )
-    parser.add_argument(
-        "--sample-name",
-        help="Sample name for consensus FASTA header and stats (default: output directory name)"
-    )
-    args = parser.parse_args()
-
-    returncode, _ = run_workflow(
-        args.forward, args.reverse, args.output,
-        trim_quality=args.trim_quality,
-        sample_name=args.sample_name,
-    )
-    sys.exit(returncode)
+    p = argparse.ArgumentParser(description="Sanger workflow for one sample")
+    p.add_argument("-f", "--forward")
+    p.add_argument("-r", "--reverse")
+    p.add_argument("-o", "--output", default="output")
+    p.add_argument("-q", "--trim-quality", type=float, default=0.05)
+    p.add_argument("--sample-name", default=None)
+    p.add_argument("--reference", help="Reference FASTA file")
+    a = p.parse_args()
+    ref = None
+    if a.reference:
+        ref = parse_reference(open(a.reference).read())
+    name = a.sample_name or os.path.basename(os.path.abspath(a.output))
+    try:
+        s = run_sample(name, a.forward, a.reverse, a.output, a.trim_quality, ref)
+    except ValueError as e:
+        print(f"ERROR: {e}")
+        sys.exit(1)
+    print(f"{name}: {s['consensus_length']} bp, rating {s['quality_rating']}, "
+          f"{s['mismatches']} F/R disagreements -> {a.output}/")
 
 
 if __name__ == "__main__":

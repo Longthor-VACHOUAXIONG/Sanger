@@ -8,7 +8,7 @@ from Bio import SeqIO
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-COLORS = {"A": "#2ca02c", "C": "#1f77b4", "G": "#7f7f7f", "T": "#d62728", "N": "#9467bd"}
+COLORS = {"A": "#2ca02c", "C": "#1f77b4", "G": "#7f7f7f", "T": "#d62728"}   # others use grey/purple fallback
 
 
 def _text(v):
@@ -34,7 +34,7 @@ def load_trace(path: str) -> dict:
     return {"channels": channels, "ploc": ploc[:n], "bases": bases[:n], "quals": quals[:n]}
 
 
-_COMP = {"A": "T", "C": "G", "G": "C", "T": "A", "N": "N"}
+_COMP = dict(zip("ACGTRYSWKMBDHVN", "TGCAYRSWMKVHDBN"))   # full IUPAC complement
 
 
 def reverse_complement_trace(trace: dict) -> dict:
@@ -84,7 +84,7 @@ def make_figure(trace: dict, center: int = 1, window: int = 60, trim=None, highl
     idx = list(range(start, end))
     fig.add_trace(go.Scatter(
         x=[ploc[i] for i in idx], y=[ymax * 1.08] * len(idx), mode="text",
-        text=[bases[i] for i in idx], textfont=dict(size=15, color=[COLORS.get(bases[i], "#999") for i in idx]),
+        text=[bases[i] for i in idx], textfont=dict(size=15, color=[COLORS.get(bases[i], "#9467bd") for i in idx]),
         customdata=[[i + 1, quals[i]] for i in idx], showlegend=False,
         hovertemplate="Base %{customdata[0]}: %{text}<br>Phred Q%{customdata[1]}<extra></extra>"),
         row=1, col=1)

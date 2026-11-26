@@ -364,15 +364,13 @@ def show_sample(s, out_dir):
     for w in s["warnings"]:
         st.warning(w)
 
-    tabs = st.tabs([t("tab_consensus"), t("tab_chrom"), t("tab_variants"), t("tab_details")])
-    with tabs[0]:
-        tab_consensus(s, out_dir)
-    with tabs[1]:
-        tab_chromatogram(s, out_dir)
-    with tabs[2]:
-        tab_differences(s)
-    with tabs[3]:
-        tab_details(s)
+    # A radio (not st.tabs) so the chosen view survives reruns, e.g. after clicking a base
+    views = {"consensus": (t("tab_consensus"), tab_consensus), "chrom": (t("tab_chrom"), tab_chromatogram),
+             "diff": (t("tab_variants"), lambda s, d: tab_differences(s)),
+             "details": (t("tab_details"), lambda s, d: tab_details(s))}
+    view = st.radio("view", list(views), format_func=lambda k: views[k][0], horizontal=True,
+                    key=f"view_{s['sample_name']}", label_visibility="collapsed")
+    views[view][1](s, out_dir)
 
 
 stats = st.session_state.stats
